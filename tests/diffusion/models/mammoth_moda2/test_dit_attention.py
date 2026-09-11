@@ -137,8 +137,7 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
 
 
 def test_backend_selection_reaches_the_dit_layer():
-    """The DiT's attention takes its backend from the diffusion config, not from
-    a model-local switch: what the config names is what executes."""
+    """The diffusion config selects the backend when the DiT layer is constructed."""
     assert _block(2).attn.omni_attn.attn_backend is DiffusionAttentionBackendEnum.TORCH_SDPA.get_class()
     with set_current_diffusion_config(
         OmniDiffusionConfig(diffusion_attention_config={"default": {"backend": "FLASH_ATTN"}})
