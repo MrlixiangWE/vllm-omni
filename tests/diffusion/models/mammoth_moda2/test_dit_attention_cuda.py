@@ -7,6 +7,7 @@ in bf16, with the padding mask the joint text+image sequence carries."""
 import pytest
 import torch
 
+import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
@@ -74,28 +75,60 @@ def test_empty_text_stream_on_the_default_backend():
     assert out.shape == (1, 0, DIM)
 
 
-@pytest.mark.parametrize("dt", [torch.float32], ids=["fp32"])
-def test_fp32_falls_back_to_sdpa_and_matches_reference(dt):
-    """FlashAttention only supports fp16/bf16 and raises on fp32, which the
-    previous SDPA arithmetic served. The processor keeps fp32 on SDPA with native
-    GQA. Without the dtype gate the shared FLASH_ATTN call raises on fp32."""
+@pytest.mark.parametrize(
+    ("seq", "force_gqa_fallback"),
+    [(512, False), (77 + 4096, False), (32, True)],
+    ids=["short", "t2i_1024", "unsupported_native_gqa"],
+)
+def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_gqa_fallback):
+    """FP32 keeps its dtype and reaches shared SDPA's GQA compatibility check.
+
+    Cover the long masked shape that otherwise falls back to quadratic math
+    attention, and force the unsupported-GQA branch independently of hardware.
+    """
     torch.manual_seed(0)
+    dt = torch.float32
     block = (
         TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
         .cuda()
         .to(dt)
         .eval()
     )
-    seq = 512
-    hidden = torch.randn(2, seq, DIM, device="cuda", dtype=dt)
-    mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
-    mask[0, seq - 40 :] = False
+    hidden = torch.randn(1, seq, DIM, device="cuda", dtype=dt)
+    mask = torch.ones(1, seq, dtype=torch.bool, device="cuda")
+    mask[:, -13:] = False
     angles = torch.rand(1, seq, block.head_dim, device="cuda")
     rotary = (angles.cos().to(dt), angles.sin().to(dt))
+    capabilities, calls = [], []
+    can_use_fused_gqa = sdpa_backend.can_sdpa_use_fused_gqa
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def check_gqa(*args):
+        supported = False if force_gqa_fallback else can_use_fused_gqa(*args)
+        capabilities.append(supported)
+        return supported
+
+    def record_sdpa(query, key, value, **kwargs):
+        calls.append((query.shape, key.shape, value.shape, query.dtype, kwargs))
+        return sdpa(query, key, value, **kwargs)
+
+    with torch.no_grad(), monkeypatch.context() as patch:
+        patch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", check_gqa)
+        patch.setattr(torch.nn.functional, "scaled_dot_product_attention", record_sdpa)
+        got = block.attn(hidden, hidden, attention_mask=mask, image_rotary_emb=rotary)
+
+    assert len(capabilities) == len(calls) == 1, "FP32 must use shared SDPA's runtime GQA check"
+    q_shape, k_shape, v_shape, dtype, kwargs = calls[0]
+    expected_kv_heads = KV_HEADS if capabilities[0] else HEADS
+    assert q_shape == (1, HEADS, seq, block.head_dim)
+    assert k_shape == v_shape == (1, expected_kv_heads, seq, block.head_dim)
+    assert dtype == got.dtype == torch.float32
+    assert kwargs["enable_gqa"] == capabilities[0]
+    assert kwargs["scale"] == block.attn.scale
+    assert kwargs["is_causal"] is False
+    assert torch.equal(kwargs["attn_mask"], mask[:, None, None, :])
+
     with torch.no_grad():
-        got = block.attn(
-            hidden_states=hidden, encoder_hidden_states=hidden, attention_mask=mask, image_rotary_emb=rotary
-        )
         want = _reference_attention(block.attn, hidden, mask, rotary)
     assert torch.isfinite(got).all()
     assert torch.count_nonzero(got[~mask]) == 0
