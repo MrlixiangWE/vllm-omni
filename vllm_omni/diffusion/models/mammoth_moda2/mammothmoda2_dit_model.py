@@ -322,14 +322,7 @@ class AttnProcessor:
             attention_mask = attention_mask.to(torch.bool)
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-        if dtype in (torch.float16, torch.bfloat16) or not hidden_states.is_cuda:
-            hidden_states = attn.omni_attn(query, key, value, attn_metadata)
-        else:
-            # FlashAttention supports only fp16/bf16 and raises on fp32 (which the
-            # previous SDPA arithmetic served); the CPU path already resolves to
-            # SDPA and handles fp32. Shared SDPA expands K/V when the runtime
-            # cannot use fused native GQA so equal-head fused kernels remain eligible.
-            hidden_states = attn.omni_attn.sdpa_fallback.forward_cuda(query, key, value, attn_metadata)
+        hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
         if attention_mask is not None:
             # Padded rows carry nothing downstream; keep them at zero as the
@@ -388,6 +381,7 @@ class TransformerBlock(nn.Module):
             causal=False,
             softmax_scale=self.attn.scale,
             num_kv_heads=num_kv_heads,
+            allow_fp32_fallback=True,
         )
 
         # Initialize feed-forward network

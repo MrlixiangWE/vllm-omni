@@ -14,6 +14,7 @@ from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Tran
 from .test_dit_attention import _reference_attention
 
 pytestmark = [
+    pytest.mark.core_model,
     pytest.mark.advanced_model,
     pytest.mark.cuda,
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
@@ -99,9 +100,19 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
     mask[:, -13:] = False
     angles = torch.rand(1, seq, block.head_dim, device="cuda")
     rotary = (angles.cos().to(dt), angles.sin().to(dt))
-    capabilities, calls = [], []
+    capabilities, calls, phases = [], [], []
     can_use_fused_gqa = sdpa_backend.can_sdpa_use_fused_gqa
     sdpa = torch.nn.functional.scaled_dot_product_attention
+    strategy = block.attn.omni_attn._get_active_parallel_strategy()
+    pre_attention, post_attention = strategy.pre_attention, strategy.post_attention
+
+    def prepare(*args):
+        phases.append("pre")
+        return pre_attention(*args)
+
+    def restore(*args):
+        phases.append("post")
+        return post_attention(*args)
 
     def check_gqa(*args):
         supported = False if force_gqa_fallback else can_use_fused_gqa(*args)
@@ -109,14 +120,18 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
         return supported
 
     def record_sdpa(query, key, value, **kwargs):
+        phases.append("sdpa")
         calls.append((query.shape, key.shape, value.shape, query.dtype, kwargs))
         return sdpa(query, key, value, **kwargs)
 
     with torch.no_grad(), monkeypatch.context() as patch:
         patch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", check_gqa)
         patch.setattr(torch.nn.functional, "scaled_dot_product_attention", record_sdpa)
+        patch.setattr(strategy, "pre_attention", prepare)
+        patch.setattr(strategy, "post_attention", restore)
         got = block.attn(hidden, hidden, attention_mask=mask, image_rotary_emb=rotary)
 
+    assert phases == ["pre", "sdpa", "post"], "FP32 must preserve the shared parallel dispatch"
     assert len(capabilities) == len(calls) == 1, "FP32 must use shared SDPA's runtime GQA check"
     q_shape, k_shape, v_shape, dtype, kwargs = calls[0]
     expected_kv_heads = KV_HEADS if capabilities[0] else HEADS
