@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """E2E test for VoxCPM2 native AR offline inference."""
 
 import os
@@ -39,8 +42,7 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     return audio
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
@@ -53,8 +55,7 @@ def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
@@ -95,8 +96,7 @@ def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_prefill_decode_mixed_batch_003(omni_runner: OmniRunner) -> None:
