@@ -824,7 +824,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     logits,
                     prepared_sampling_metadata,
                     input_batch=self.input_batch,
-                    requests=self.requests,
+                    requests=getattr(self, "requests", None),
                 )
                 if sampler_output is not None:
                     return sampler_output
