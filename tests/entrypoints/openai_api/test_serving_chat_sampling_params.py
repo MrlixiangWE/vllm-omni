@@ -9,6 +9,7 @@ are correctly applied to the comprehension stage while preserving YAML defaults.
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from pytest_mock import MockerFixture
@@ -327,9 +328,7 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
     assert captured["prompt"]["negative_prompt"] == "avoid blur"
 
 
-def test_text_only_request_reaches_engine_with_comprehension_task_mode(
-    mock_engine_client, mocker: MockerFixture
-):
+def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engine_client, mocker: MockerFixture):
     """Exercise the production chat path, not only the tagging helper."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -381,7 +380,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(
 
     assert asyncio.run(serving_chat._create_chat_completion(request)) == "done"
 
-    sampling_params_list = captured["sampling_params_list"]
+    sampling_params_list = cast(list[Any], captured["sampling_params_list"])
     assert sampling_params_list[0].extra_args == {"ar_task_mode": "comprehension"}
     assert sampling_params_list[1].extra_args == {}
     assert captured["output_modalities"] == ["text"]
