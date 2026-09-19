@@ -59,7 +59,11 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
-from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import (
+    call_model_sampler,
+    clamp_prompt_ids_to_penalty_padding,
+    sanitize_min_tokens_stop_ids,
+)
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
@@ -460,22 +464,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if output_token_ids != sampling_metadata.output_token_ids:
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
-
-    def _build_model_sampler_extra_args(self) -> list[dict | None]:
-        """Per-row ``SamplingParams.extra_args`` for custom model samplers.
-
-        Rows follow ``input_batch.req_ids`` order — the same order
-        ``_build_model_sampler_output_token_ids`` uses — so models that set
-        ``model_sampler_wants_extra_args = True`` can key per-request
-        behavior (e.g. HunyuanImage3's ``ar_task_mode``) off the row index.
-        """
-        requests = getattr(self, "requests", {}) or {}
-        per_req_extra_args: list[dict | None] = []
-        for req_id in getattr(self.input_batch, "req_ids", []):
-            state = requests.get(req_id)
-            params = getattr(state, "sampling_params", None)
-            per_req_extra_args.append(getattr(params, "extra_args", None))
-        return per_req_extra_args
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
@@ -1331,14 +1319,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
-                if getattr(self.model, "model_sampler_wants_extra_args", False):
-                    sampler_output = model_sample(
-                        logits,
-                        prepared_sampling_metadata,
-                        per_req_extra_args=self._build_model_sampler_extra_args(),
-                    )
-                else:
-                    sampler_output = model_sample(logits, prepared_sampling_metadata)
+                sampler_output = call_model_sampler(
+                    self.model,
+                    model_sample,
+                    logits,
+                    prepared_sampling_metadata,
+                    input_batch=self.input_batch,
+                    requests=self.requests,
+                )
                 if sampler_output is not None:
                     return sampler_output
                 # Contract: None => fall back to the default sampler (see
