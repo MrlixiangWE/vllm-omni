@@ -49,6 +49,7 @@ class DiffusionKVCacheManager:
         max_model_len: int,
         scheduler_block_size: int,
         hash_block_size: int,
+        max_rows_per_request: int,
         max_in_flight_tokens: int | None = None,
     ) -> None:
         if max_model_len <= 0:
@@ -57,6 +58,8 @@ class DiffusionKVCacheManager:
             raise ValueError("Diffusion KVCacheConfig must contain a positive block pool and at least one group")
         if scheduler_block_size <= 0 or hash_block_size <= 0:
             raise ValueError("scheduler_block_size and hash_block_size must be positive")
+        if type(max_rows_per_request) is not int or max_rows_per_request <= 0:
+            raise ValueError(f"max_rows_per_request must be a positive integer, got {max_rows_per_request!r}")
         if max_in_flight_tokens is not None and max_in_flight_tokens <= 0:
             raise ValueError(f"max_in_flight_tokens must be positive when provided, got {max_in_flight_tokens}")
         self.native_manager = KVCacheManager(
@@ -68,6 +71,7 @@ class DiffusionKVCacheManager:
             enable_caching=False,
         )
         self.max_model_len = max_model_len
+        self.max_rows_per_request = max_rows_per_request
         # Native vLLM may reserve a null block, so an idle BlockPool does not
         # necessarily report ``kv_cache_config.num_blocks`` free blocks.
         self._empty_pool_num_free_blocks = self.native_manager.block_pool.get_num_free_blocks()
@@ -149,6 +153,12 @@ class DiffusionKVCacheManager:
         if not requests:
             raise ValueError("Diffusion KV allocation requires at least one sequence")
         contexts, sequence_context_ids = self._collect_contexts(requests)
+        num_rows = len(requests) + len(contexts)
+        if num_rows > self.max_rows_per_request:
+            raise DiffusionKVAdmissionError(
+                f"Diffusion KV request {public_request_id!r} requires {num_rows} rows; "
+                f"adapter limit is {self.max_rows_per_request}"
+            )
         context_requests = tuple(_ContextKVRequest(public_request_id, context) for context in contexts)
         native_requests: tuple[DiffusionKVRequest | _ContextKVRequest, ...] = (*requests, *context_requests)
 

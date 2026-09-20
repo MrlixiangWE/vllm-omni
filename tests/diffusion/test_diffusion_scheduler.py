@@ -95,6 +95,7 @@ def _initialize_paged_scheduler(
     *,
     num_blocks: int = 64,
     max_num_seqs: int = 1,
+    max_rows_per_request: int = 4,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(
@@ -111,6 +112,7 @@ def _initialize_paged_scheduler(
     scheduler.initialize(
         SimpleNamespace(
             diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            diffusion_kv_max_rows_per_request=max_rows_per_request,
             max_model_len=64,
             max_num_seqs=max_num_seqs,
         ),
@@ -539,6 +541,41 @@ class TestRequestScheduler:
             _make_request_output(request.request_id),
         )
         assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    def test_diffusion_kv_row_limit_rejects_contexts_before_allocation(self, mocker: MockerFixture) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_rows_per_request=2)
+        request = _make_request("too-many-rows")
+        contexts = (
+            DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8),
+            DiffusionKVContext(context_id="ar", cache_role="ar_decode", num_tokens=8),
+        )
+        request.diffusion_kv_requests = (
+            DiffusionKVRequest(
+                "too-many-rows/diffusion-kv/0",
+                sequence_id=0,
+                prefix_len=4,
+                target_len=4,
+                seq_len=8,
+                kv_contexts=contexts,
+            ),
+        )
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        allocate_slots = mocker.spy(manager.native_manager, "allocate_slots")
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(request)
+        scheduler_output = self.scheduler.schedule()
+
+        state = self.scheduler.get_request_state(request.request_id)
+        assert state is not None
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "Diffusion KV request 'too-many-rows' requires 3 rows; adapter limit is 2"
+        assert scheduler_output.finished_req_ids == {request.request_id}
+        assert scheduler_output.scheduled_request_ids == []
+        assert manager.has_request(request.request_id) is False
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+        allocate_slots.assert_not_called()
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)

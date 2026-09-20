@@ -41,12 +41,18 @@ def _request(public_id: str, sequence_id: int, *, seq_len: int = 8, kv_contexts=
     )
 
 
-def _manager(num_blocks: int, *, max_model_len: int = 64) -> DiffusionKVCacheManager:
+def _manager(
+    num_blocks: int,
+    *,
+    max_model_len: int = 64,
+    max_rows_per_request: int = 4,
+) -> DiffusionKVCacheManager:
     return DiffusionKVCacheManager(
         _config(num_blocks),
         max_model_len=max_model_len,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
+        max_rows_per_request=max_rows_per_request,
     )
 
 
