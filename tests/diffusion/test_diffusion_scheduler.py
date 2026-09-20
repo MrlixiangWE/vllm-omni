@@ -138,6 +138,28 @@ def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> 
     )
 
 
+def _attach_request_scoped_context(
+    request: OmniDiffusionRequest,
+    *,
+    context_id: str | None = None,
+) -> None:
+    context = DiffusionKVContext(
+        context_id=context_id if context_id is not None else f"{request.request_id}-ar",
+        cache_role="ar_decode",
+        num_tokens=8,
+    )
+    request.diffusion_kv_requests = (
+        DiffusionKVRequest(
+            f"{request.request_id}/diffusion-kv/0",
+            sequence_id=0,
+            prefix_len=4,
+            target_len=4,
+            seq_len=8,
+            kv_contexts=(context,),
+        ),
+    )
+
+
 class _StubScheduler:
     def __init__(self, request: OmniDiffusionRequest, output) -> None:
         self._request = request
@@ -576,6 +598,145 @@ class TestRequestScheduler:
         assert manager.has_request(request.request_id) is False
         assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
         allocate_slots.assert_not_called()
+
+    def test_request_scoped_context_waiting_abort_never_allocates(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5, max_num_seqs=2)
+        aborted = _make_request("aborted")
+        surviving = _make_request("surviving")
+        _attach_request_scoped_context(aborted)
+        _attach_request_scoped_context(surviving)
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(aborted)
+        self.scheduler.add_request(surviving)
+        self.scheduler.finish_requests("aborted", DiffusionRequestStatus.FINISHED_ABORTED)
+
+        assert not manager.has_request("aborted")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == ["surviving"]
+        assert sched_output.finished_req_ids == {"aborted"}
+        assert manager.has_request("surviving")
+
+        self.scheduler.update_from_output(sched_output, _make_request_output("surviving"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    def test_request_scoped_context_running_abort_releases_before_output_update(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5)
+        aborted = _make_request("aborted")
+        _attach_request_scoped_context(aborted)
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(aborted)
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == ["aborted"]
+        assert manager.has_request("aborted")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
+
+        self.scheduler.finish_requests("aborted", DiffusionRequestStatus.FINISHED_ABORTED)
+        assert not manager.has_request("aborted")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+        # The Engine still needs to observe the terminal ID from this output.
+        assert self.scheduler.update_from_output(sched_output, _make_request_output("aborted")) == {"aborted"}
+        assert self.scheduler.get_request_state("aborted").status == DiffusionRequestStatus.FINISHED_ABORTED
+        assert _new_ids(self.scheduler.schedule()) == []
+
+        surviving = _make_request("surviving")
+        _attach_request_scoped_context(surviving)
+        self.scheduler.add_request(surviving)
+        surviving_output = self.scheduler.schedule()
+        assert _new_ids(surviving_output) == ["surviving"]
+        self.scheduler.update_from_output(surviving_output, _make_request_output("surviving"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    def test_request_scoped_context_preemption_reuses_allocation(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5)
+        request = _make_request("preempted")
+        _attach_request_scoped_context(request)
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(request)
+        self.scheduler.schedule()
+        metadata = manager.get_metadata("preempted")
+        free_allocated = manager.native_manager.block_pool.get_num_free_blocks()
+        assert free_allocated == free_before - 4
+
+        assert self.scheduler.preempt_request("preempted") is True
+        assert manager.has_request("preempted")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_allocated
+        resumed_output = self.scheduler.schedule()
+        assert _new_ids(resumed_output) == []
+        assert _cached_ids(resumed_output) == ["preempted"]
+        assert manager.get_metadata("preempted") == metadata
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_allocated
+
+        self.scheduler.finish_requests("preempted", DiffusionRequestStatus.FINISHED_COMPLETED)
+        assert not manager.has_request("preempted")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    def test_request_scoped_context_backpressure_retries_without_partial_ownership(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=7, max_num_seqs=2)
+        first = _make_request("first")
+        second = _make_request("second")
+        _attach_request_scoped_context(first)
+        _attach_request_scoped_context(second)
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(first)
+        self.scheduler.add_request(second)
+        first_output = self.scheduler.schedule()
+        assert _new_ids(first_output) == ["first"]
+        assert first_output.num_waiting_reqs == 1
+        assert manager.has_request("first")
+        assert not manager.has_request("second")
+        first_metadata = manager.get_metadata("first")
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
+
+        self.scheduler.update_from_output(first_output, _make_request_output("first"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+        second_output = self.scheduler.schedule()
+        assert _new_ids(second_output) == ["second"]
+        assert manager.has_request("second")
+        assert manager.get_metadata("second").allocation_generation > first_metadata.allocation_generation
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
+
+        self.scheduler.update_from_output(second_output, _make_request_output("second"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    def test_request_scoped_context_request_id_reuse_gets_new_generation(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5)
+        first = _make_request("reused")
+        _attach_request_scoped_context(first, context_id="ar")
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+        self.scheduler.add_request(first)
+        first_output = self.scheduler.schedule()
+        first_metadata = manager.get_metadata("reused")
+        self.scheduler.update_from_output(first_output, _make_request_output("reused"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+        self.scheduler.pop_request_state("reused")
+
+        second = _make_request("reused")
+        _attach_request_scoped_context(second, context_id="ar")
+        self.scheduler.add_request(second)
+        second_output = self.scheduler.schedule()
+        second_metadata = manager.get_metadata("reused")
+        assert _new_ids(second_output) == ["reused"]
+        assert second_metadata.allocation_generation > first_metadata.allocation_generation
+        assert [context.context_id for context in second_metadata.contexts] == ["ar"]
+
+        self.scheduler.update_from_output(second_output, _make_request_output("reused"))
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)
