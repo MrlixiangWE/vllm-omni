@@ -59,8 +59,8 @@ the measured results are summarized below.
 ### Optional FP8 AR KV cache
 
 For CUDA deployments, `mammoth_moda2_fp8_kv.yaml` is an opt-in preset that
-stores the Stage 0 AR KV cache as FP8 E4M3, except decoder layer 0, which stays
-BF16 (`kv_cache_dtype_skip_layers: ["0"]`). Stage 1 remains on
+keeps the Stage 0 AR KV cache of decoder layer 0 in BF16 and stores the other
+27 layers as FP8 E4M3 (`kv_cache_dtype_skip_layers: ["0"]`). Stage 1 remains on
 `kv_cache_dtype=auto`; its DiT execution is unaffected. This setting quantizes
 only the autoregressive KV cache. It is neither FP8 weight/activation
 quantization nor vLLM-Omni diffusion KV-cache quantization.
@@ -109,14 +109,14 @@ an image counts when it shows the prompted subject and scene.
 
 | Stage 0 KV cache | GPU KV cache size | Cat images that follow the prompt | Samoyed images that follow the prompt |
 | --- | ---: | ---: | ---: |
-| BF16 (`auto`) | 147,408 tokens | 6/6 | 6/6 |
-| FP8 E4M3, all layers | 294,816 tokens | 1/6 | 0/6 |
-| FP8 E4M3, layer 0 in BF16 (this preset) | 284,640 tokens | 6/6 | 6/6 |
+| BF16 on all 28 layers (`auto`) | 147,408 tokens | 6/6 | 6/6 |
+| FP8 E4M3 on all 28 layers | 294,816 tokens | 1/6 | 0/6 |
+| Layer 0 BF16, other 27 layers FP8 E4M3 (this preset) | 284,640 tokens | 6/6 | 6/6 |
 
-With every layer in FP8, most cat images become a framed print on a wall.
+With all 28 layers in FP8, most cat images become a framed print on a wall.
 Keeping layer 0 in BF16 restores them; keeping only layer 27, which has the
-largest key magnitude, does not. The H800 numbers above were measured with every
-layer in FP8; this preset has been run on A800 only.
+largest key magnitude, does not. The H800 numbers above were measured with all 28
+layers in FP8; this preset has been run on A800 only.
 
 ### 1x L40S 48GB
 
