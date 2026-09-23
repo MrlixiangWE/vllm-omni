@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.utils import free_kv_blocks_in_physical_order
 from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVContextMetadata,
     DiffusionKVMetadata,
@@ -273,7 +274,7 @@ class DiffusionKVCacheManager:
             self.native_manager.free(context_request)
             self._internal_request_ids.discard(context_request.request_id)
         for request in reversed(requests):
-            self.native_manager.free(request)
+            free_kv_blocks_in_physical_order(self.native_manager, request)
             self._internal_request_ids.discard(request.request_id)
 
     def close(self) -> None:
@@ -282,4 +283,4 @@ class DiffusionKVCacheManager:
 
     def _rollback(self, requests: Sequence[DiffusionKVRequest | _ContextKVRequest]) -> None:
         for request in reversed(requests):
-            self.native_manager.free(request)
+            free_kv_blocks_in_physical_order(self.native_manager, request)
