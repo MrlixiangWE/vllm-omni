@@ -26,7 +26,8 @@ in deep DiT blocks.
 | Ascend NPU | ❌ |
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
-guide. FP8 on Ampere may use a weight-only path where available.
+guide. On Ampere, FP8 linear layers run on vLLM's Marlin weight-only kernel
+(FP8 weights, BF16/FP16 activations).
 
 ### Faster FP8 GEMM on Blackwell (quack)
 

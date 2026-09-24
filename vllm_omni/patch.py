@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
+import inspect
 import logging
 import os
 import sys
@@ -566,6 +567,78 @@ def _patch_inductor_factorable_divisibility():
 
 
 _patch_inductor_factorable_divisibility()
+
+
+# =============================================================================
+# Patch CutlassFP8ScaledMMLinearKernel.is_supported to check CUTLASS FP8 support
+# =============================================================================
+# WHY: In vLLM 0.30.0, ``CutlassFP8ScaledMMLinearKernel.is_supported`` only checks
+# ``current_platform.is_cuda()``. The kernel sits ahead of
+# ``MarlinFP8ScaledMMLinearKernel`` in the CUDA FP8 kernel list, so on CUDA
+# devices without CUTLASS FP8 (e.g. SM80, A100/A800) FP8 linear layers select it
+# and the first GEMM raises ``RuntimeError: cutlass_scaled_mm_sm80_epilogue``;
+# the stage fails to initialize unless CUTLASS is excluded, e.g. with
+# ``VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel``. vLLM 0.28 listed
+# Marlin first; the order changed with the 0.29 rebase.
+#
+# WHY NOT model-level: vLLM's ``init_fp8_linear_kernel`` picks the kernel for
+# every FP8 linear method, in AR stages and diffusion stages alike, before any
+# model code can intervene.
+#
+# SCOPE: adds the ``cutlass_fp8_supported()`` check that vLLM #55884 added
+# upstream. Devices with CUTLASS FP8 (SM89+) are unaffected; on the others the
+# kernel reports unsupported and selection falls through to Marlin (weight-only
+# FP8), the kernel the env-var workaround selects. Non-CUDA platforms return
+# from the original ``is_cuda()`` check first.
+#
+# SELF-EXTINGUISH: vLLM #55884 (merged after v0.30.0) calls
+# ``cutlass_fp8_supported`` from ``is_supported``; when the installed version
+# does, nothing is installed.
+#
+# FRAGILITY: relies on ``is_supported`` being a classmethod of
+# ``CutlassFP8ScaledMMLinearKernel`` and on ``w8a8_utils.cutlass_fp8_supported``;
+# installation raises if either changes.
+#
+# TODO: remove once the pinned vLLM contains #55884.
+def _patch_cutlass_fp8_is_supported() -> None:
+    try:
+        from vllm.model_executor.kernels.linear import CutlassFP8ScaledMMLinearKernel
+        from vllm.model_executor.layers.quantization.utils import w8a8_utils
+    except ImportError:
+        _PATCH_LOGGER.debug("[cutlass-fp8] CutlassFP8ScaledMMLinearKernel not available; skipping patch")
+        return
+
+    descriptor = inspect.getattr_static(CutlassFP8ScaledMMLinearKernel, "is_supported")
+    if not isinstance(descriptor, classmethod):
+        raise RuntimeError(
+            "CutlassFP8ScaledMMLinearKernel.is_supported is no longer a classmethod; "
+            "revisit the CUTLASS FP8 patch in vllm_omni/patch.py."
+        )
+    original = descriptor.__func__
+    if getattr(original, "_omni_cutlass_fp8_patched", False):
+        return
+    if "cutlass_fp8_supported" in original.__code__.co_names:
+        _PATCH_LOGGER.debug("[cutlass-fp8] upstream is_supported already checks CUTLASS FP8; skipping patch")
+        return
+    if not callable(getattr(w8a8_utils, "cutlass_fp8_supported", None)):
+        raise RuntimeError(
+            "vllm w8a8_utils.cutlass_fp8_supported is missing; revisit the CUTLASS FP8 patch in vllm_omni/patch.py."
+        )
+
+    def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+        supported, reason = original(cls, compute_capability)
+        if not supported:
+            return supported, reason
+        if not w8a8_utils.cutlass_fp8_supported():
+            return False, "CUTLASS FP8 kernels not available"
+        return True, None
+
+    setattr(is_supported, "_omni_cutlass_fp8_patched", True)
+    CutlassFP8ScaledMMLinearKernel.is_supported = classmethod(is_supported)
+    _PATCH_LOGGER.info("[cutlass-fp8] CutlassFP8ScaledMMLinearKernel.is_supported patched: requires CUTLASS FP8.")
+
+
+_patch_cutlass_fp8_is_supported()
 
 
 # =============================================================================
