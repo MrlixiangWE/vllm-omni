@@ -170,6 +170,7 @@ def _config():
             kv_connector_extra_config={"mooncake_protocol": "tcp", "enable_kv_async_prefetch": True},
         ),
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        diffusion_kv_max_rows_per_request=2,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
     )
@@ -256,7 +257,11 @@ def _scheduler(monkeypatch, num_blocks=24):
         kv_cache_config=config,
         scheduler_block_size=4,
         hash_block_size=4,
-        kv_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64), max_in_flight_tokens=64),
+        kv_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=64),
+            max_in_flight_tokens=64,
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+        ),
     )
     return scheduler, connector
 
