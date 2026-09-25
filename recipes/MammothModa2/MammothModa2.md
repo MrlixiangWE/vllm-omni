@@ -60,7 +60,8 @@ the measured results are summarized below.
 
 For CUDA deployments, `mammoth_moda2_fp8_kv.yaml` is an opt-in preset that
 keeps the Stage 0 AR KV cache of decoder layer 0 in BF16 and stores the other
-27 layers as FP8 E4M3 (`kv_cache_dtype_skip_layers: ["0"]`). Stage 1 remains on
+27 layers as FP8 E4M3 (`kv_cache_dtype_skip_layers: ["0"]`; write the layer
+indices as quoted strings). Stage 1 remains on
 `kv_cache_dtype=auto`; its DiT execution is unaffected. This setting quantizes
 only the autoregressive KV cache. It is neither FP8 weight/activation
 quantization nor vLLM-Omni diffusion KV-cache quantization.
@@ -112,6 +113,11 @@ an image counts when it shows the prompted subject and scene.
 | BF16 on all 28 layers (`auto`) | 147,408 tokens | 6/6 | 6/6 |
 | FP8 E4M3 on all 28 layers | 294,816 tokens | 1/6 | 0/6 |
 | Layer 0 BF16, other 27 layers FP8 E4M3 (this preset) | 284,640 tokens | 6/6 | 6/6 |
+
+The KV cache sizes above still count the 28 attention layers of the replaced
+Qwen-VL language model, which #8095 removes: with it, BF16 goes from 147,408 to
+294,816 tokens and all-FP8 from 294,816 to 589,632. The prompt-following
+columns do not depend on it.
 
 With all 28 layers in FP8, most cat images become a framed print on a wall.
 Keeping layer 0 in BF16 restores them; keeping only layer 27, which has the
