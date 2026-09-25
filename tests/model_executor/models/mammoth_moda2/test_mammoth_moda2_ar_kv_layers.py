@@ -52,7 +52,17 @@ class _FakeCompiledLM(_FakeLM):
         type(self).cleanups += 1
 
 
-def _build(monkeypatch, ar_class, parent, *, encoder_only=False, parent_lm=_FakeLM, parent_registers=True):
+def _build(
+    monkeypatch,
+    ar_class,
+    parent,
+    *,
+    encoder_only=False,
+    parent_lm=_FakeLM,
+    parent_registers=True,
+    pp_rank=(1, True),
+    stray_parent_layer=False,
+):
     registry: dict = {}
     built = {}
 
@@ -62,6 +72,9 @@ def _build(monkeypatch, ar_class, parent, *, encoder_only=False, parent_lm=_Fake
         stock = nn.Module()
         stock.model = parent_lm(registry if parent_registers else {}, f"{prefix}.language_model.model")
         built["parent_lm"] = weakref.ref(stock)
+        if stray_parent_layer:
+            # A parent-prefixed layer that is not part of the module being dropped.
+            registry[f"{prefix}.language_model.model.layers.9.self_attn.attn"] = nn.Module()
         self.language_model = StageMissingLayer("language_model", stock) if encoder_only else stock
 
     # The model module only imports get_current_vllm_config with this fix; keep the
@@ -77,6 +90,10 @@ def _build(monkeypatch, ar_class, parent, *, encoder_only=False, parent_lm=_Fake
     monkeypatch.setattr(mm2, "MammothModa2Qwen3ForCausalLM", lambda *, vllm_config, prefix: _FakeLM(registry, prefix))
     monkeypatch.setattr(mm2, "TorchCompileWithNoGuardsWrapper", _FakeCompiledLM, raising=False)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    world_size, is_first_rank = pp_rank
+    monkeypatch.setattr(
+        mm2, "get_pp_group", lambda: SimpleNamespace(world_size=world_size, is_first_rank=is_first_rank)
+    )
 
     hf_config = SimpleNamespace(llm_config=SimpleNamespace(text_config=SimpleNamespace()))
     vllm_config = SimpleNamespace(
@@ -108,3 +125,21 @@ def test_compiled_parent_language_model_releases_its_hook(monkeypatch, ar_class,
 def test_unexpected_parent_registry_fails_loudly(monkeypatch, ar_class, parent):
     with pytest.raises(RuntimeError, match="Unexpected attention registry"):
         _build(monkeypatch, ar_class, parent, parent_registers=False)
+
+
+@pytest.mark.parametrize(("ar_class", "parent"), AR_CLASSES, ids=AR_IDS)
+def test_later_pipeline_rank_without_parent_layers_starts(monkeypatch, ar_class, parent):
+    _, registry, _ = _build(monkeypatch, ar_class, parent, parent_registers=False, pp_rank=(2, False))
+    assert set(registry) == {f"ar.language_model.layers.{i}.self_attn.attn" for i in range(NUM_LAYERS)} | {VISION_LAYER}
+
+
+@pytest.mark.parametrize(("ar_class", "parent"), AR_CLASSES, ids=AR_IDS)
+def test_first_pipeline_rank_without_parent_layers_fails(monkeypatch, ar_class, parent):
+    with pytest.raises(RuntimeError, match="Unexpected attention registry"):
+        _build(monkeypatch, ar_class, parent, parent_registers=False, pp_rank=(2, True))
+
+
+@pytest.mark.parametrize(("ar_class", "parent"), AR_CLASSES, ids=AR_IDS)
+def test_later_pipeline_rank_still_rejects_a_leftover_parent_layer(monkeypatch, ar_class, parent):
+    with pytest.raises(RuntimeError, match="Unexpected attention registry"):
+        _build(monkeypatch, ar_class, parent, parent_registers=False, pp_rank=(2, False), stray_parent_layer=True)

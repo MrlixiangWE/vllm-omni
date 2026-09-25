@@ -649,7 +649,11 @@ def _drop_parent_language_model(model: nn.Module, prefix: str) -> None:
     for name in dropped:
         del ctx[name]
     stale = [name for name in ctx if name.startswith(maybe_prefix(prefix, "language_model."))]
-    if not dropped or stale:
+    # A later pipeline rank may hold none of the parent's layers, so only the first
+    # rank has to find some; no rank may leave any behind.
+    pp_group = get_pp_group()
+    must_drop = pp_group.world_size == 1 or pp_group.is_first_rank
+    if (must_drop and not dropped) or stale:
         raise RuntimeError(
             f"Unexpected attention registry for the parent language model (dropped {len(dropped)}, left {stale}); "
             "check the Qwen-VL __init__."
