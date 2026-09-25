@@ -19,6 +19,8 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 if TYPE_CHECKING:
     import torch
 
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
+
 
 @dataclass
 class ForwardContext:
@@ -32,7 +34,10 @@ class ForwardContext:
     # Runner-owned paged execution metadata/runtime. Attention resolves the
     # active Worker adapter from it; model code must not construct BlockTable
     # rows or activate the runtime directly.
-    paged_kv_runtime: object | None = None
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
+    # Block-aligned prefix already resident in Scheduler-owned pages for the
+    # active request-level prefill. Zero keeps the cold/full-prefill path.
+    paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -59,6 +64,10 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Pre-padding global sequence length per SequenceParallelInput shard_group,
+    # for models that auto-pad several independent sequences in one boundary.
+    # The singleton fields above remain for single-sequence models.
+    sp_shard_metadata: dict[str, int] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -122,6 +131,13 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def get_sp_shard_original_seq_len(shard_group: str) -> int | None:
+    """Pre-padding global length of `shard_group`, or None if it was not split."""
+    if not is_forward_context_available():
+        return None
+    return get_forward_context().sp_shard_metadata.get(shard_group)
+
+
 def build_local_sp_padding_mask(
     batch_size: int,
     local_seq_len: int,
@@ -177,7 +193,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -187,6 +204,7 @@ def create_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -213,7 +231,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -227,6 +246,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
