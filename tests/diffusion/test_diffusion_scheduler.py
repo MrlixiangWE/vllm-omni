@@ -1059,6 +1059,28 @@ class TestRequestScheduler:
 
         assert finished == {"impossible", "schedulable"}
 
+    def test_impossible_request_scoped_context_capacity_finishes_only_that_request(self) -> None:
+        # Two free blocks hold the sequence but not the sequence and its context.
+        # Admission has to count the context, or the request waits at the head
+        # of the queue on every tick and nothing behind it is scheduled.
+        _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)
+        impossible = _make_request("impossible")
+        schedulable = _make_request("schedulable")
+        _attach_request_scoped_context(impossible)
+        _attach_diffusion_kv(schedulable, seq_len=4, prefix_len=0)
+        self.scheduler.add_request(impossible)
+        self.scheduler.add_request(schedulable)
+
+        sched_output = self.scheduler.schedule()
+
+        failed_state = self.scheduler.get_request_state("impossible")
+        assert failed_state is not None
+        assert failed_state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert failed_state.error is not None
+        assert "required_blocks=4, available_blocks=2" in failed_state.error
+        assert sched_output.finished_req_ids == {"impossible"}
+        assert _new_ids(sched_output) == ["schedulable"]
+
     def test_impossible_diffusion_kv_capacity_does_not_block_waiters_under_load(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=4, max_num_seqs=2)
         running = _make_request("running")

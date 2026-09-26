@@ -432,6 +432,21 @@ def test_context_capacity_pressure_rolls_back_partial_request() -> None:
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
+def test_rejects_request_whose_contexts_can_never_fit_the_empty_pool() -> None:
+    # Three free blocks hold the two-block sequence but not the two-block
+    # context beside it. Without the context term the bound would admit the
+    # request, allocation would fail on every tick, and it would wait forever.
+    manager = _manager(4)
+    context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
+
+    with pytest.raises(DiffusionKVAdmissionError, match="cannot fit even when the block pool is empty"):
+        manager.reserve_request(
+            "public",
+            (_request("public", 0, kv_contexts=(context,)),),
+        )
+    assert manager.has_request("public") is False
+
+
 def test_rejects_context_longer_than_admission_bound() -> None:
     manager = _manager(8, max_model_len=8)
     context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=9)

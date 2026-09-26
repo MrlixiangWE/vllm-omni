@@ -292,7 +292,7 @@ class DiffusionKVCacheManager:
             raise DiffusionKVAdmissionError(
                 f"Diffusion KV request {public_request_id!r} cannot fit even when the block pool is empty: "
                 f"required_blocks={required_blocks}, available_blocks={self._empty_pool_num_free_blocks}; "
-                "increase KV cache capacity or reduce the request sequence count/length"
+                "increase KV cache capacity or reduce the request sequence/context count or length"
             )
 
         allocated: list[DiffusionKVRequest | _ContextKVRequest] = []
