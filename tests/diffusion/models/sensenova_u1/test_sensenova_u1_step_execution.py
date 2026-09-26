@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.interface import (
     supports_resumable_prepare,
     supports_step_execution,
@@ -268,6 +269,46 @@ class TestTextLoop:
         assert _tokens(7) == _tokens(7)
         assert _tokens(7) != _tokens(9)
 
+    @staticmethod
+    def _sampled_tokens(pipe, logits, **kwargs) -> list[int]:
+        cursor = pipe._begin_text(logits, "kv", 0, max_tokens=4, do_sample=True, temperature=1.0, **kwargs)
+        _run_to_end(pipe, cursor, pipe._text_step)
+        return list(cursor.tokens)
+
+    def test_the_request_generator_drives_the_draw_on_the_logits_device(self):
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB)
+        from_request = self._sampled_tokens(pipe, flat, request_generator=torch.Generator().manual_seed(7))
+        assert from_request == self._sampled_tokens(pipe, flat, seed=7)
+
+    def test_a_generator_list_falls_back_to_the_request_seed(self):
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB)
+        tokens = self._sampled_tokens(pipe, flat, request_generator=[torch.Generator().manual_seed(1)], seed=7)
+        assert tokens == self._sampled_tokens(pipe, flat, seed=7)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.cuda
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device(self):
+        # generator_device="cpu" gives the runner's generator a CPU device
+        # while the logits it samples from sit on the GPU.
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB, device="cuda")
+        cursor = pipe._begin_text(
+            flat,
+            "kv",
+            0,
+            max_tokens=4,
+            do_sample=True,
+            temperature=1.0,
+            seed=7,
+            request_generator=torch.Generator("cpu").manual_seed(7),
+        )
+        assert cursor.generator.device == flat.device
+        probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
+        torch.multinomial(probs, num_samples=1, generator=cursor.generator)
+
     def test_text_cursor_survives_being_left_between_tokens(self):
         successor = {1: 2, 2: 3, 3: EOS}
         serial = _pipeline(successor)
@@ -475,7 +516,8 @@ class TestThroughTheRunner:
         )
         return runner
 
-    def test_an_image_request_denoises_through_the_runner(self, monkeypatch: pytest.MonkeyPatch):
+    @pytest.mark.parametrize("mode", ["t2i", "it2i"])
+    def test_an_image_request_denoises_through_the_runner(self, monkeypatch: pytest.MonkeyPatch, mode):
         """The three step methods an image request uses, driven by the runner.
 
         `denoise_step` and `step_scheduler` run for real; only `_denoise_one`,
@@ -501,14 +543,21 @@ class TestThroughTheRunner:
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+        # An editing request is routed by its input image; only the prefix and
+        # cache builders that need the vision tower are replaced.
+        pipe._extract_input_images = lambda first_prompt: ["image"] if mode == "it2i" else None
+        pipe._it2i_prefix = lambda p, ns, images: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._it2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
         v_pred = torch.full((1, 4, 16 * 16 * 3), 2.0)
         seen: list[int] = []
+        edit_flags: list[bool] = []
 
         def _denoise_one(z, ns, caches, p, step_i, is_edit):
             # Production re-patchifies the latents each step and returns the
             # patched tensor alongside the prediction, so the Euler update in
             # `_advance_latents` operates on the patched layout.
             seen.append(step_i)
+            edit_flags.append(is_edit)
             return torch.zeros_like(v_pred), v_pred
 
         pipe._denoise_one = _denoise_one
@@ -549,6 +598,7 @@ class TestThroughTheRunner:
         # One denoise per interval, in order, and the latents carry the Euler
         # update for each of them: sum((t_next - t) * 2.0) over the schedule.
         assert seen == [0, 1, 2]
+        assert edit_flags == [mode == "it2i"] * 3
         assert request_output.finished is True
         assert request_output.result.output["payload"]["image"] is not None
         assert "req-img" not in runner.state_cache

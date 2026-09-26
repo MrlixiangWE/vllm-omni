@@ -159,11 +159,11 @@ the optional `SupportsResumablePrepare` companion:
 
 | Operation | Responsibility |
 | --- | --- |
-| `prepare_steps_remaining(state)` | Upper bound on remaining prepare steps, or `None` once prepare is done |
+| `prepare_steps_remaining(state)` | Upper bound on remaining prepare steps, or `None` or `0` once prepare is done |
 | `prepare_step(state)` | Advance the prepare phase by one step |
 
 The runner then calls `prepare_encode()`, and afterwards one `prepare_step()`
-per scheduler tick until `prepare_steps_remaining()` returns `None`, and the
+per scheduler tick until `prepare_steps_remaining()` returns `None` or `0`, and the
 step that ends the phase puts the request back into the same tick's denoise
 batch. A request inside its prepare phase is not part of that batch, so the
 requests past their own prepare phase keep denoising while it decodes; a
@@ -176,7 +176,7 @@ A pipeline whose prepare phase produces the whole output leaves
 and finishes it as soon as prepare is done, without a denoise step.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
+Qwen-Image, BAGEL, HunyuanImage3, Helios, and SenseNova-U1 / U1.5. Step execution alone does not
 imply continuous-batching support: Qwen-Image accepts batched step states.
 BAGEL accepts batched step states for image generation with its default,
 think-mode, and single-stage deploy configs. Only the diffusion stage uses the

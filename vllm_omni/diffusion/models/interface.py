@@ -175,7 +175,7 @@ class SupportsResumablePrepare(Protocol):
 
     A request may finish inside the prepare phase: a pipeline that produces text
     leaves ``state.timesteps`` unset, and the runner decodes its output as soon
-    as ``prepare_steps_remaining()`` returns ``None``.
+    as ``prepare_steps_remaining()`` returns ``None`` or ``0``.
     """
 
     supports_resumable_prepare: ClassVar[bool] = True

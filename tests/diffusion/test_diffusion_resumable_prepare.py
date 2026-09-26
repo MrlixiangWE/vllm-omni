@@ -99,6 +99,13 @@ class _ResumablePipeline(_StepPipeline):
         state.extra["remaining"] -= 1
 
 
+class _ZeroWhenDonePipeline(_ResumablePipeline):
+    """Reports a finished prepare phase as ``0`` rather than ``None``."""
+
+    def prepare_steps_remaining(self, state):
+        return state.extra.get("remaining", 0)
+
+
 class _TextOnlyPipeline(_ResumablePipeline):
     """Prepare phase produces the whole output; there is nothing to denoise."""
 
@@ -207,11 +214,13 @@ class TestCapability:
 
 
 class TestResumablePrepare:
+    @pytest.mark.parametrize("pipeline_cls", [_ResumablePipeline, _ZeroWhenDonePipeline])
     def test_prepare_runs_one_step_per_invocation_before_any_denoise(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        pipeline_cls,
     ):
-        pipeline = _ResumablePipeline(prepare_steps=3)
+        pipeline = pipeline_cls(prepare_steps=3)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
@@ -235,21 +244,52 @@ class TestResumablePrepare:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        pipeline = _ResumablePipeline(prepare_steps=3)
+        pipeline = _ResumablePipeline(prepare_steps=0, num_steps=1)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        DiffusionModelRunner.execute_stepwise(runner, _new_output())
+        # The first request denoises its only step and finishes, which leaves
+        # its batch behind.
+        output = DiffusionModelRunner.execute_stepwise(runner, _new_output("req-1"))
+        assert output.get_request_output("req-1").finished is True
+        assert runner.input_batch is not None
 
-        # Nothing denoised, so no batch may be left holding the latents and the
-        # states of whatever ran before.
+        # Nothing denoises on the next tick, so no batch may be left holding the
+        # latents and the states of the request that ran before.
+        pipeline.prepare_steps = 3
+        DiffusionModelRunner.execute_stepwise(runner, _new_output("req-2", step_id=1))
+        assert pipeline.prepare_step_calls == 1
         assert runner.input_batch is None
 
-    def test_a_request_that_asks_for_no_prepare_steps_denoises_immediately(
+    def test_a_request_past_prepare_keeps_denoising_while_another_prepares(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        pipeline = _ResumablePipeline(prepare_steps=0)
+        pipeline = _ResumablePipeline(prepare_steps=0, num_steps=4)
+        runner = _make_runner(pipeline)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        DiffusionModelRunner.execute_stepwise(runner, _new_output("req-a"))
+        assert pipeline.denoise_calls == 1
+
+        pipeline.prepare_steps = 3
+        both = _new_output("req-b", step_id=1)
+        both.scheduled_cached_reqs = CachedRequestData(request_ids=["req-a"])
+        both.num_running_reqs = 2
+        output = DiffusionModelRunner.execute_stepwise(runner, both)
+
+        # req-b spends this tick on one prepare step; req-a does not wait for it.
+        assert pipeline.prepare_step_calls == 1
+        assert pipeline.denoise_calls == 2
+        assert runner.state_cache["req-a"].step_index == 2
+        assert output.get_request_output("req-b").finished is False
+
+    @pytest.mark.parametrize("pipeline_cls", [_ResumablePipeline, _ZeroWhenDonePipeline])
+    def test_a_request_that_asks_for_no_prepare_steps_denoises_immediately(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pipeline_cls,
+    ):
+        pipeline = pipeline_cls(prepare_steps=0)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 

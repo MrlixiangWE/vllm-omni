@@ -998,7 +998,9 @@ class SenseNovaU1Pipeline(
             # The runner seeds `sampling_params.generator` when the request
             # carries a seed and leaves it None otherwise; an unseeded request
             # draws from the global RNG, as it did before step execution.
-            if request_generator is not None:
+            # `generator_device` can put it elsewhere, and multinomial only
+            # takes a generator on the device it samples on.
+            if isinstance(request_generator, torch.Generator) and request_generator.device == prefix_logits.device:
                 generator = request_generator
             elif seed is not None:
                 # The draw happens on the logits, so the generator belongs to
