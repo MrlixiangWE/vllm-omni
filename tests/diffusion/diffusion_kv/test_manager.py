@@ -327,6 +327,28 @@ def test_reserves_request_scoped_context_and_releases_it_with_the_request() -> N
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
+def test_context_with_block_hashes_never_reads_the_prefix_cache(monkeypatch) -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    context = DiffusionKVContext(context_id="ar", cache_role="ar_decode", num_tokens=8, block_hashes=(b"h0", b"h1"))
+    looked_up = []
+    real_lookup = manager.native_manager.get_computed_blocks
+
+    def recording_lookup(request):
+        looked_up.append(request.request_id)
+        return real_lookup(request)
+
+    monkeypatch.setattr(manager.native_manager, "get_computed_blocks", recording_lookup)
+
+    metadata = manager.reserve_request("public", (_request("public", 0, kv_contexts=(context,)),))
+
+    assert metadata is not None
+    assert all(shim.skip_reading_prefix_cache for shim in manager._context_requests["public"])
+    assert "public/diffusion-kv/context/ar" not in looked_up
+    manager.free_request("public")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
 def test_shared_context_is_allocated_once_for_multiple_sequences() -> None:
     manager = _manager(8)
     free_before = manager.native_manager.block_pool.get_num_free_blocks()

@@ -33,7 +33,8 @@ class _ContextKVRequest:
         self.num_prompt_tokens = context.num_tokens
         self.num_computed_tokens = 0
         self.block_hashes = list(context.block_hashes)
-        self.skip_reading_prefix_cache = not self.block_hashes
+        # Contexts are never looked up in the prefix cache, whatever hashes they carry.
+        self.skip_reading_prefix_cache = True
         self.status = RequestStatus.WAITING
         self.num_preemptions = 0
         self.num_in_flight_tokens = 0
@@ -401,7 +402,7 @@ class DiffusionKVCacheManager:
         context_requests = self._context_requests.pop(public_request_id, ())
         self._metadata.pop(public_request_id, None)
         for context_request in reversed(context_requests):
-            self.native_manager.free(context_request)
+            free_kv_blocks_in_physical_order(self.native_manager, context_request)
             self._internal_request_ids.discard(context_request.request_id)
         for request in reversed(requests):
             free_kv_blocks_in_physical_order(self.native_manager, request)
