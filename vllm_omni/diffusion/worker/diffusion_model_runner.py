@@ -1323,6 +1323,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if result is not None:
                 result = self._prepare_output_for_transport(result, state.sampling)
                 self._attach_stepwise_metadata(state, result)
+                # Same hand-off as a request that finishes after denoising.
+                self._maybe_send_stage_payload([state], [result])
                 # This request never reaches the denoise loop's memory
                 # accounting, so it is sampled here instead.
                 is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

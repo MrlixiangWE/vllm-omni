@@ -311,6 +311,24 @@ class TestResumablePrepare:
         assert pipeline.decode_calls == 1
         assert "req-1" not in runner.state_cache
 
+    def test_prepare_only_request_sends_its_stage_payload_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        pipeline = _TextOnlyPipeline(prepare_steps=2)
+        runner = _make_runner(pipeline)
+        sent = []
+        runner._maybe_send_stage_payload = lambda reqs, outputs: sent.append(
+            ([req.request_id for req in reqs], [out.output for out in outputs])
+        )
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        DiffusionModelRunner.execute_stepwise(runner, _new_output())
+        assert sent == []
+
+        DiffusionModelRunner.execute_stepwise(runner, _cached_output())
+        assert sent == [(["req-1"], [{"payload": {"text": "done"}}])]
+
     def test_prepare_only_request_reports_its_peak_memory(
         self,
         monkeypatch: pytest.MonkeyPatch,
