@@ -17,7 +17,12 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    supports_encoder_cudagraph,
+)
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
@@ -104,6 +109,22 @@ class Qwen2_5OmniForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.token2wav = None
+            if supports_encoder_cudagraph(self.thinker):
+                # Expose the protocol on this stage instance only. Defining
+                # these methods on the shared class also advertises an encoder
+                # for talker/token2wav under runtime structural protocol checks.
+                self.supports_encoder_cudagraph = True
+                self.get_encoder_cudagraph_config = self.thinker.get_encoder_cudagraph_config
+                self.get_input_modality = self.thinker.get_input_modality
+                self.get_max_frames_per_video = self.thinker.get_max_frames_per_video
+                self.get_encoder_cudagraph_budget_range = self.thinker.get_encoder_cudagraph_budget_range
+                self.get_encoder_cudagraph_item_specs = self.thinker.get_encoder_cudagraph_item_specs
+                self.select_encoder_cudagraph_items = self.thinker.select_encoder_cudagraph_items
+                self.prepare_encoder_cudagraph_capture_inputs = self.thinker.prepare_encoder_cudagraph_capture_inputs
+                self.prepare_encoder_cudagraph_replay_buffers = self.thinker.prepare_encoder_cudagraph_replay_buffers
+                self.encoder_cudagraph_forward = self.thinker.encoder_cudagraph_forward
+                self.encoder_eager_forward = self.thinker.encoder_eager_forward
+                self.postprocess_encoder_output = self.thinker.postprocess_encoder_output
 
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
