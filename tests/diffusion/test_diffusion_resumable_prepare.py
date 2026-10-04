@@ -10,14 +10,22 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm import forward_context as vllm_forward_context
+from vllm.config import VllmConfig
+from vllm.config.vllm import get_current_vllm_config_or_none
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.models.interface import (
     supports_resumable_prepare,
     supports_step_execution,
 )
+from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import SenseNovaU1ForCausalLM
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -214,6 +222,53 @@ class TestCapability:
 
 
 class TestResumablePrepare:
+    @pytest.mark.parametrize("stage", ["prepare_encode", "prepare_step", "post_decode"])
+    def test_prepare_model_calls_receive_the_native_moe_context(self, stage):
+        calls: list[str] = []
+        model = SimpleNamespace(has_moe=True)
+
+        class Pipeline(_TextOnlyPipeline):
+            def check_model_context(self, current_stage):
+                if stage != current_stage:
+                    return
+                assert get_current_vllm_config_or_none() is runner.vllm_config
+                assert get_forward_context().vllm_config is runner.vllm_config
+                with SenseNovaU1ForCausalLM._vllm_forward_context(model):
+                    context = vllm_forward_context.get_forward_context()
+                    assert context.no_compile_layers is runner.vllm_config.compilation_config.static_forward_context
+                    calls.append(current_stage)
+
+            def prepare_encode(self, state, **kwargs):
+                self.check_model_context("prepare_encode")
+                return super().prepare_encode(state, **kwargs)
+
+            def prepare_step(self, state):
+                self.check_model_context("prepare_step")
+                return super().prepare_step(state)
+
+            def post_decode(self, state, **kwargs):
+                self.check_model_context("post_decode")
+                return super().post_decode(state, **kwargs)
+
+        pipeline = Pipeline(prepare_steps=2)
+        runner = _make_runner(pipeline)
+        runner.vllm_config = VllmConfig()
+        previous_config = get_current_vllm_config_or_none()
+        previous_native_context = vllm_forward_context.is_forward_context_available()
+        previous_omni_context = get_forward_context() if is_forward_context_available() else None
+
+        first = runner.execute_stepwise(_new_output()).get_request_output("req-1")
+        assert first.finished is False
+        second = runner.execute_stepwise(_cached_output()).get_request_output("req-1")
+        assert second.finished is True
+        assert second.result.error is None
+        assert calls == ([stage, stage] if stage == "prepare_step" else [stage])
+        assert get_current_vllm_config_or_none() is previous_config
+        assert vllm_forward_context.is_forward_context_available() is previous_native_context
+        assert is_forward_context_available() is (previous_omni_context is not None)
+        if previous_omni_context is not None:
+            assert get_forward_context() is previous_omni_context
+
     @pytest.mark.parametrize("pipeline_cls", [_ResumablePipeline, _ZeroWhenDonePipeline])
     def test_prepare_runs_one_step_per_invocation_before_any_denoise(
         self,
