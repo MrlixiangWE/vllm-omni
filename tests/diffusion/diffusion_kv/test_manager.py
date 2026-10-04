@@ -58,6 +58,7 @@ def _manager(
     *,
     max_model_len: int = 64,
     max_rows_per_request: int = 4,
+    max_num_rows: int = 64,
     enable_prefix_caching: bool = False,
 ) -> DiffusionKVCacheManager:
     return DiffusionKVCacheManager(
@@ -66,8 +67,60 @@ def _manager(
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         max_rows_per_request=max_rows_per_request,
+        max_num_rows=max_num_rows,
         enable_prefix_caching=enable_prefix_caching,
     )
+
+
+@pytest.mark.parametrize("max_num_rows", [0, -1, True, 1.0, None])
+def test_rejects_invalid_worker_row_capacity(max_num_rows) -> None:
+    with pytest.raises(ValueError, match="max_num_rows must be a positive integer"):
+        _manager(32, max_num_rows=max_num_rows)
+
+
+def test_aggregate_worker_rows_backpressure_before_native_allocation(monkeypatch) -> None:
+    manager = _manager(32, max_num_rows=4)
+    context = DiffusionKVContext(context_id="ar", cache_role="ar_decode", num_tokens=8)
+
+    def requests(public_id):
+        return tuple(_request(public_id, index, kv_contexts=(context,)) for index in range(2))
+
+    first = manager.reserve_request("first", requests("first"))
+    assert first is not None
+    assert len(first.sequences) == 2
+    assert len(first.contexts) == 1
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    allocate_slots = manager.native_manager.allocate_slots
+    allocations = []
+
+    def allocate(*args, **kwargs):
+        allocations.append(args[0].request_id)
+        return allocate_slots(*args, **kwargs)
+
+    monkeypatch.setattr(manager.native_manager, "allocate_slots", allocate)
+    assert manager.reserve_request("second", requests("second")) is None
+    assert not manager.has_request("second")
+    assert allocations == []
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    # An exact-fit primary row is still admissible while the larger request waits.
+    assert manager.reserve_request("small", (_request("small", 0),)) is not None
+    manager.free_request("first")
+    assert manager.reserve_request("second", requests("second")) is not None
+    manager.free_request("second")
+    manager.free_request("small")
+    assert not manager._internal_request_ids
+
+
+def test_request_exceeding_empty_worker_rows_is_a_permanent_admission_error(monkeypatch) -> None:
+    manager = _manager(32, max_num_rows=2)
+    contexts = tuple(
+        DiffusionKVContext(context_id=str(index), cache_role="ar_decode", num_tokens=8) for index in range(2)
+    )
+    monkeypatch.setattr(manager.native_manager, "allocate_slots", lambda *args, **kwargs: pytest.fail("allocated"))
+
+    with pytest.raises(DiffusionKVAdmissionError, match="requires 3 rows; Worker capacity is 2"):
+        manager.reserve_request("too-large", (_request("too-large", 0, kv_contexts=contexts),))
 
 
 def test_successful_request_publishes_prefix_for_a_warm_hit() -> None:

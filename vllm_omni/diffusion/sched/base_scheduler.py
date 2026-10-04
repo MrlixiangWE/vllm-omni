@@ -123,6 +123,7 @@ class BaseScheduler(ABC):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 max_rows_per_request=max_rows_per_request,
+                max_num_rows=kv_vllm_config.scheduler_config.max_num_seqs,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
                 enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
                 prefix_caching_hash_algo=getattr(

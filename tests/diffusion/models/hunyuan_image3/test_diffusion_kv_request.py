@@ -464,6 +464,7 @@ def prefix_cache_manager(request):
         scheduler_block_size=4,
         hash_block_size=4,
         max_rows_per_request=2,
+        max_num_rows=2,
         enable_prefix_caching=getattr(request, "param", True),
     )
     yield manager

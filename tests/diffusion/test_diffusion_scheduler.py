@@ -97,6 +97,7 @@ def _initialize_paged_scheduler(
     num_blocks: int = 64,
     max_num_seqs: int = 1,
     max_rows_per_request: int = 4,
+    max_num_rows: int | None = None,
     enable_prefix_caching: bool = False,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
@@ -123,6 +124,9 @@ def _initialize_paged_scheduler(
         hash_block_size=4,
         kv_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=64),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=max_num_seqs * max_rows_per_request if max_num_rows is None else max_num_rows,
+            ),
             max_in_flight_tokens=64,
             cache_config=SimpleNamespace(
                 enable_prefix_caching=enable_prefix_caching,
@@ -635,6 +639,37 @@ class TestRequestScheduler:
             _make_request_output(request.request_id),
         )
         assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+    @pytest.mark.parametrize("max_num_rows, expected_ids", [(4, ["first"]), (16, ["first", "second"])])
+    def test_aggregate_worker_rows_gate_concurrent_context_requests(self, max_num_rows, expected_ids) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=4, max_num_rows=max_num_rows)
+        for request_id in ("first", "second"):
+            request = _make_request(request_id)
+            contexts = tuple(
+                DiffusionKVContext(context_id=str(index), cache_role="ar_decode", num_tokens=8) for index in range(2)
+            )
+            request.diffusion_kv_requests = (
+                DiffusionKVRequest(
+                    f"{request_id}/diffusion-kv/0",
+                    sequence_id=0,
+                    prefix_len=4,
+                    target_len=4,
+                    seq_len=8,
+                    kv_contexts=contexts,
+                ),
+            )
+            self.scheduler.add_request(request)
+
+        output = self.scheduler.schedule()
+        assert _new_ids(output) == expected_ids
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        assert manager.max_num_rows == max_num_rows
+        if max_num_rows == 4:
+            assert output.num_waiting_reqs == 1
+            assert not manager.has_request("second")
+            self.scheduler.finish_requests("first", DiffusionRequestStatus.FINISHED_ABORTED)
+            assert _new_ids(self.scheduler.schedule()) == ["second"]
 
     def test_diffusion_kv_row_limit_rejects_contexts_before_allocation(self, mocker: MockerFixture) -> None:
         _initialize_paged_scheduler(self.scheduler, max_rows_per_request=2)

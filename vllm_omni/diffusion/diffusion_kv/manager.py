@@ -54,6 +54,7 @@ class DiffusionKVCacheManager:
         scheduler_block_size: int,
         hash_block_size: int,
         max_rows_per_request: int,
+        max_num_rows: int,
         max_in_flight_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_hash_algo: str = "sha256",
@@ -66,6 +67,8 @@ class DiffusionKVCacheManager:
             raise ValueError("scheduler_block_size and hash_block_size must be positive")
         if type(max_rows_per_request) is not int or max_rows_per_request <= 0:
             raise ValueError(f"max_rows_per_request must be a positive integer, got {max_rows_per_request!r}")
+        if type(max_num_rows) is not int or max_num_rows <= 0:
+            raise ValueError(f"max_num_rows must be a positive integer, got {max_num_rows!r}")
         if max_in_flight_tokens is not None and max_in_flight_tokens <= 0:
             raise ValueError(f"max_in_flight_tokens must be positive when provided, got {max_in_flight_tokens}")
         self._hash_function = get_hash_fn_by_name(prefix_caching_hash_algo)
@@ -79,6 +82,7 @@ class DiffusionKVCacheManager:
         )
         self.max_model_len = max_model_len
         self.max_rows_per_request = max_rows_per_request
+        self.max_num_rows = max_num_rows
         self.hash_block_size = hash_block_size
         self.enable_prefix_caching = enable_prefix_caching
         # Native vLLM may reserve a null block, so an idle BlockPool does not
@@ -238,6 +242,11 @@ class DiffusionKVCacheManager:
                 f"Diffusion KV request {public_request_id!r} requires {num_rows} rows; "
                 f"adapter limit is {self.max_rows_per_request}"
             )
+        if num_rows > self.max_num_rows:
+            raise DiffusionKVAdmissionError(
+                f"Diffusion KV request {public_request_id!r} requires {num_rows} rows; "
+                f"Worker capacity is {self.max_num_rows}"
+            )
         context_requests = tuple(_ContextKVRequest(public_request_id, context) for context in contexts)
 
         native_requests: tuple[DiffusionKVRequest | _ContextKVRequest, ...] = (*requests, *context_requests)
@@ -294,6 +303,12 @@ class DiffusionKVCacheManager:
                 f"required_blocks={required_blocks}, available_blocks={self._empty_pool_num_free_blocks}; "
                 "increase KV cache capacity or reduce the request sequence/context count or length"
             )
+
+        # Worker rows are a separate resource from native KV blocks. Include
+        # primary sequences and deduplicated contexts of every live reservation,
+        # including requests waiting for a prefetched transfer to complete.
+        if len(self._internal_request_ids) + num_rows > self.max_num_rows:
+            return None
 
         allocated: list[DiffusionKVRequest | _ContextKVRequest] = []
         sequence_metadata: list[DiffusionKVSequenceMetadata] = []
