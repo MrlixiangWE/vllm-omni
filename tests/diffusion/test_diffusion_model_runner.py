@@ -413,7 +413,7 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
     runner.state_cache = {"aborted-step-request": object()}
-    old_step_batch = object()
+    old_step_batch = SimpleNamespace(request_ids=["aborted-step-request"])
     runner.input_batch = old_step_batch
     runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
     runner.remove_diffusion_kv_requests = Mock()

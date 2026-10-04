@@ -1123,8 +1123,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
-        for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+        self.release_step_requests(list(finished_req_ids))
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1132,6 +1131,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             and finished_req_ids
         ):
             self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def release_step_requests(self, request_ids: Sequence[str]) -> int:
+        """Drop request-local state and batch references after execution.
+
+        Other live states remain authoritative and rebuild their batch on the
+        next wave. Native KV cleanup retains its generation/draining contract.
+        """
+        unique_request_ids = set(request_ids)
+        if not unique_request_ids:
+            return 0
+        released = sum(self.state_cache.pop(request_id, None) is not None for request_id in unique_request_ids)
+        batch = self.input_batch
+        if batch is not None and not unique_request_ids.isdisjoint(batch.request_ids):
+            self.input_batch = None
+        return released
 
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Resolve cached state and create state for newly admitted requests."""
@@ -1490,12 +1504,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            return self._execute_stepwise_core(
+            output = self._execute_stepwise_core(
                 scheduler_output,
                 record_output_peak_memory=record_output_peak_memory,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
+            # The startup profiler retains the first denoise batch as proof it
+            # sized denoise allocations, then releases it in its own finally.
+            if not in_diffusion_kv_memory_profile:
+                self.release_step_requests([item.request_id for item in output.runner_outputs if item.finished])
+            return output
         except Exception:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
