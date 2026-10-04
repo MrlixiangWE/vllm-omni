@@ -15,6 +15,7 @@ from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
+from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.diffusion.data import (
@@ -40,6 +41,17 @@ class OmniGPUWorkerBase(GPUWorker):
     It also replaces vLLM's TorchProfilerWrapper with OmniTorchProfilerWrapper
     for custom trace naming, background gzip, and trace path collection.
     """
+
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready."""
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
 
     def load_model(self, *args, **kwargs):
         with self._maybe_get_memory_pool_context("weights"):
@@ -121,7 +133,8 @@ class OmniGPUWorkerBase(GPUWorker):
                VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS is enabled (it is by
                default). Graphs captured outside that dispatcher are not in it:
                ``GPUARModelRunner.capture_model`` captures the talker MTP graphs
-               after ``super().capture_model()``, and under
+               after ``super().capture_model()``, and model
+               ``capture_auxiliary_graphs`` hooks run after warmup. Under
                ``parallel_stage_init`` those remain covered by the reserve in
                ``engine/stage_admission``; on the default path nothing accounts
                for them.
@@ -326,7 +339,7 @@ class OmniGPUWorkerBase(GPUWorker):
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
+    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"
         try:
             if isinstance(task, dict):
@@ -380,7 +393,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK | None:
         "Handle deterministic Wakeup command from the main process"
         try:
             if isinstance(task, dict):
