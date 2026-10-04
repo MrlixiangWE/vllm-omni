@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGraphManager
@@ -86,14 +87,7 @@ def _config(stage="thinker", *, embeds=False):
         mm_encoder_tp_mode="weights",
         mm_encoder_attn_dtype=None,
     )
-    hf = SimpleNamespace(
-        thinker_config=SimpleNamespace(),
-        talker_config=SimpleNamespace(),
-        code2wav_config=SimpleNamespace(),
-        tts_bos_token_id=1,
-        tts_eos_token_id=2,
-        tts_pad_token_id=3,
-    )
+    hf = Qwen3OmniMoeConfig(tts_bos_token_id=1, tts_eos_token_id=2, tts_pad_token_id=3)
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf, multimodal_config=mm, model_stage=stage, max_model_len=32),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
@@ -104,6 +98,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        speculative_config=None,
     )
     cfg.with_hf_config = lambda *args, **kwargs: cfg
     return cfg
@@ -178,12 +173,12 @@ def test_runner_builds_no_manager_without_multimodal_inputs(monkeypatch):
 def test_thinker_construction_enables_the_image_graph(monkeypatch):
     cfg = _config()
     cfg.quant_config = None
-    cfg.model_config.hf_config.thinker_config = SimpleNamespace(
-        architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"],
-        audio_config=None,
-        vision_config=SimpleNamespace(deepstack_visual_indexes=[0, 1], out_hidden_size=4),
-        text_config=SimpleNamespace(rms_norm_eps=1e-6, hidden_size=4),
-    )
+    thinker_config = cfg.model_config.hf_config.thinker_config
+    thinker_config.architectures = ["Qwen3OmniMoeThinkerForConditionalGeneration"]
+    thinker_config.vision_config.deepstack_visual_indexes = [0, 1]
+    thinker_config.vision_config.out_hidden_size = 4
+    thinker_config.text_config.rms_norm_eps = 1e-6
+    thinker_config.text_config.hidden_size = 4
     language_model = nn.Module()
     language_model.make_empty_intermediate_tensors = None
     monkeypatch.setattr(thinker_module, "Qwen3OmniMoeAudioEncoder", lambda *args, **kwargs: nn.Identity())
