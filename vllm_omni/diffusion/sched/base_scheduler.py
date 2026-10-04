@@ -304,6 +304,8 @@ class BaseScheduler(ABC):
             scheduler_output.kv_transfer_request_ids = self._kv_transfer_request_ids
             self._kv_transfer_request_ids = set()
         if self._native_prefetch_enabled:
+            connector = self._kv_connector
+            assert connector is not None, "Native KV prefetch requires a KV connector"
             scheduler_output.kv_required_request_ids = self._loading_sequence_ids(self._running)
             # Flush current-request metadata before staging B. Mooncake
             # batches ready requests from the same producer into one write;
@@ -311,9 +313,7 @@ class BaseScheduler(ABC):
             self._try_native_prefetch()
             prefetch_finished_ids = self._kv_finished_request_ids - scheduler_output.kv_finished_request_ids
             if self._kv_transfer_request_ids or prefetch_finished_ids:
-                scheduler_output.kv_prefetch_connector_metadata = self._kv_connector.build_connector_meta(
-                    scheduler_output
-                )
+                scheduler_output.kv_prefetch_connector_metadata = connector.build_connector_meta(scheduler_output)
                 scheduler_output.kv_prefetch_request_ids = self._kv_transfer_request_ids
                 scheduler_output.kv_transfer_request_ids |= self._kv_transfer_request_ids
                 self._kv_transfer_request_ids = set()
@@ -335,6 +335,9 @@ class BaseScheduler(ABC):
         if state is None or state.is_finished() or not state.diffusion_kv_requests:
             return
         manager = self._diffusion_kv_manager
+        connector = self._kv_connector
+        if manager is None or connector is None:
+            return
         if manager.has_request(request_id):
             return
         matched_tokens = []
@@ -347,7 +350,7 @@ class BaseScheduler(ABC):
                 or params["num_transfer_tokens"] <= 0
             ):
                 return
-            num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
+            num_tokens, _ = connector.get_num_new_matched_tokens(request, 0)
             if num_tokens is None:
                 return
             matched_tokens.append(num_tokens)
@@ -373,7 +376,7 @@ class BaseScheduler(ABC):
         self._kv_request_generations[request_id] = allocation.allocation_generation
         try:
             transfer_ids = commit_kv_load(
-                self._kv_connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
+                connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
             )
         except KVTransferRegistrationError as exc:
             # Rollback may already notify the producer to release its pages.

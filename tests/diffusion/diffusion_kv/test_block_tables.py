@@ -184,14 +184,32 @@ class _FakeNumBlocks:
 class _FakeBlockTables:
     instances: list[_FakeBlockTables] = []
 
-    def __init__(self, **kwargs: object) -> None:
-        self.kwargs = kwargs
-        self.block_sizes = list(kwargs["block_sizes"])
-        self.max_num_reqs = int(kwargs["max_num_reqs"])
-        self.max_num_batched_tokens = int(kwargs["max_num_batched_tokens"])
-        self.cp_size = int(kwargs["cp_size"])
-        self.cp_rank = int(kwargs["cp_rank"])
-        self.cp_interleave = int(kwargs["cp_interleave"])
+    def __init__(
+        self,
+        *,
+        block_sizes: list[int],
+        max_num_reqs: int,
+        max_num_batched_tokens: int,
+        cp_size: int,
+        cp_rank: int,
+        cp_interleave: int,
+        **kwargs: object,
+    ) -> None:
+        self.kwargs = dict(
+            kwargs,
+            block_sizes=block_sizes,
+            max_num_reqs=max_num_reqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_interleave=cp_interleave,
+        )
+        self.block_sizes = list(block_sizes)
+        self.max_num_reqs = max_num_reqs
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.cp_size = cp_size
+        self.cp_rank = cp_rank
+        self.cp_interleave = cp_interleave
         self.blocks_per_kv_block = [1] * len(self.block_sizes)
         self.block_tables = [_FakeStagedTable() for _ in self.block_sizes]
         self.num_blocks = _FakeNumBlocks(len(self.block_sizes), self.max_num_reqs)

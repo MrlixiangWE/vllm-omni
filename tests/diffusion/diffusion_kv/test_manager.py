@@ -469,6 +469,45 @@ def test_context_allocation_failure_rolls_back_sequences_and_earlier_contexts(mo
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
+@pytest.mark.parametrize("failure_index", [1, 2, 3, 4])
+def test_allocation_exception_after_native_mutation_rolls_back_and_can_retry(monkeypatch, failure_index) -> None:
+    manager = _manager(24)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    native_allocate = manager.native_manager.allocate_slots
+    attempted_ids: list[str] = []
+    contexts = (
+        DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8),
+        DiffusionKVContext(context_id="image", cache_role="cross.image", num_tokens=8),
+    )
+    requests = tuple(_request("public", i, kv_contexts=contexts) for i in range(2))
+
+    def fail_after_allocation(request, *args, **kwargs):
+        blocks = native_allocate(request, *args, **kwargs)
+        assert blocks is not None
+        attempted_ids.append(request.request_id)
+        if len(attempted_ids) == failure_index:
+            raise RuntimeError("injected failure after native allocation")
+        return blocks
+
+    monkeypatch.setattr(manager.native_manager, "allocate_slots", fail_after_allocation)
+    with pytest.raises(RuntimeError, match="injected failure after native allocation"):
+        manager.reserve_request("public", requests)
+
+    assert manager.has_request("public") is False
+    assert manager._internal_request_ids == set()
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+    for request_id in attempted_ids:
+        assert all(not group for group in manager.native_manager.get_block_ids(request_id))
+
+    monkeypatch.setattr(manager.native_manager, "allocate_slots", native_allocate)
+    metadata = manager.reserve_request("public", requests)
+    assert metadata is not None
+    assert len(metadata.sequences) == 2
+    assert len(metadata.contexts) == 2
+    manager.free_request("public")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
 def test_context_capacity_pressure_rolls_back_partial_request() -> None:
     manager = _manager(5)
     assert manager.reserve_request("running", (_request("running", 0),)) is not None

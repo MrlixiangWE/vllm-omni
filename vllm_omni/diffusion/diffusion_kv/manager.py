@@ -324,6 +324,9 @@ class DiffusionKVCacheManager:
             for request, request_computed_blocks, context_ids in zip(
                 requests, computed_blocks, sequence_context_ids, strict=True
             ):
+                # Native allocation can mutate block ownership before raising.
+                # Track the attempted row so rollback includes that mutation.
+                allocated.append(request)
                 blocks = self.native_manager.allocate_slots(
                     request,
                     num_new_tokens=request.seq_len - cached_prefix_len,
@@ -336,7 +339,6 @@ class DiffusionKVCacheManager:
                     self._rollback(allocated)
                     allocated.clear()
                     return None
-                allocated.append(request)
                 request.num_computed_tokens = cached_prefix_len
                 sequence_metadata.append(
                     DiffusionKVSequenceMetadata(
@@ -350,6 +352,7 @@ class DiffusionKVCacheManager:
                     )
                 )
             for context, context_request in zip(contexts, context_requests, strict=True):
+                allocated.append(context_request)
                 blocks = self.native_manager.allocate_slots(
                     context_request,
                     num_new_tokens=context_request.num_tokens,
@@ -360,7 +363,6 @@ class DiffusionKVCacheManager:
                     self._rollback(allocated)
                     allocated.clear()
                     return None
-                allocated.append(context_request)
                 context_metadata.append(
                     DiffusionKVContextMetadata(
                         context_id=context.context_id,
