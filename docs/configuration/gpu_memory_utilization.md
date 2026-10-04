@@ -19,13 +19,16 @@ For each stage, vLLM-Omni calculates the requested memory as:
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-The system checks that:
+When other stages already occupy the same GPU, Omni caps this requested budget:
 
 ```text
-free_memory ≥ requested_memory
+requested_memory = min(requested_memory, free_memory)
 ```
 
-If this condition is not met, the stage will fail to initialize with an error message showing the memory requirements.
+The worker logs a warning when it caps the budget. Model and runtime allocations
+are subtracted from that budget when sizing the KV cache. Initialization can
+still fail if the remaining budget cannot hold the required cache. Raising
+`gpu_memory_utilization` does not increase a budget already capped to free memory.
 
 ### Memory Components
 

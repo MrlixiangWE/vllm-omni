@@ -253,7 +253,8 @@ def test_the_upstream_graph_profiler_is_callable_with_no_arguments(runner_path):
     assert required == []
 
 
-def test_a_capped_budget_is_not_told_to_raise_utilization(monkeypatch, caplog):
+@pytest.mark.parametrize("apply_estimate", [True, False])
+def test_a_capped_budget_is_not_told_to_raise_utilization(monkeypatch, caplog, apply_estimate):
     """`request_memory_tolerant` caps the budget to the free memory when Omni
     stages share a GPU. The reserve still applies, but no utilization restores
     it, so the log must not send the operator after one."""
@@ -263,14 +264,21 @@ def test_a_capped_budget_is_not_told_to_raise_utilization(monkeypatch, caplog):
     worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     worker.model_runner.profile_cudagraph_memory = lambda: 4 * GIB
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
-    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1" if apply_estimate else "0")
     monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
 
-    with caplog.at_level("INFO", logger=base.logger.name):
-        worker.determine_available_memory()
+    with caplog.at_level("INFO" if apply_estimate else "WARNING", logger=base.logger.name):
+        budget = worker.determine_available_memory()
 
     message = "\n".join(record.getMessage() for record in caplog.records)
-    assert "capped to the free memory" in message
+    assert budget == (13 if apply_estimate else 17) * GIB
+    if apply_estimate:
+        assert "capped to the free memory" in message
+    else:
+        assert "not reserved" in message
+        assert "capped budget" in message
+        assert "Reserved" not in message
+        assert "lower the value to" not in message
     assert "raise it to" not in message
 
 

@@ -227,6 +227,32 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         current_util = self.cache_config.gpu_memory_utilization
         uncapped_memory = self.init_snapshot.total_memory * current_util
+        if not envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+            if self.requested_memory < uncapped_memory:
+                logger.warning_once(
+                    "CUDA graph memory is not reserved (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): "
+                    "%s GiB of graph pool is allocated on top of this stage's capped budget. "
+                    "Re-enable the reserve or free memory on the device to leave room for the pool; "
+                    "the budget is capped to free memory, so raising --gpu-memory-utilization "
+                    "does not create room.",
+                    format_gib(cudagraph_memory_estimate),
+                    scope="local",
+                )
+            else:
+                equivalent_util = max(
+                    round(current_util - cudagraph_memory_estimate / self.init_snapshot.total_memory, 4), 0.0
+                )
+                logger.warning_once(
+                    "CUDA graph memory is not reserved (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): %s GiB "
+                    "of graph pool is allocated on top of this stage's budget, so it exceeds "
+                    "--gpu-memory-utilization=%.4f. Re-enable the reserve, or lower the value to %.4f "
+                    "to leave room for the pool.",
+                    format_gib(cudagraph_memory_estimate),
+                    current_util,
+                    equivalent_util,
+                    scope="local",
+                )
+            return
         if self.requested_memory < uncapped_memory:
             logger.info_once(
                 "Reserved %s GiB for CUDA graphs out of this stage's KV budget. The budget is "
@@ -241,18 +267,6 @@ class OmniGPUWorkerBase(GPUWorker):
         util_delta = cudagraph_memory_estimate / self.init_snapshot.total_memory
         equivalent_util = max(round(current_util - util_delta, 4), 0.0)
         suggested_util = round(current_util + util_delta, 4)
-        if not envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-            logger.warning_once(
-                "CUDA graph memory is not reserved (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): %s GiB "
-                "of graph pool is allocated on top of this stage's budget, so it exceeds "
-                "--gpu-memory-utilization=%.4f. Re-enable the reserve, or lower the value to %.4f "
-                "to leave room for the pool.",
-                format_gib(cudagraph_memory_estimate),
-                current_util,
-                equivalent_util,
-                scope="local",
-            )
-            return
         if suggested_util > 1.0:
             logger.info_once(
                 "Reserved %s GiB for CUDA graphs. --gpu-memory-utilization=%.4f now leaves the KV "
