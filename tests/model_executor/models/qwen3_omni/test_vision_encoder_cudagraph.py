@@ -98,6 +98,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_max_frames_per_batch=None,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        device_config=SimpleNamespace(device="cpu"),
         speculative_config=None,
     )
     cfg.with_hf_config = lambda *args, **kwargs: cfg

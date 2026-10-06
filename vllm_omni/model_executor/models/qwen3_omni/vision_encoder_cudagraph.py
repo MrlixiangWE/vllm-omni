@@ -39,18 +39,19 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
     def _enable_image_encoder_cudagraph(self) -> None:
         # Only the first pipeline rank runs the encoder. Dynamic-scale FP8 ViT
         # attention advances a host-side amax slot per call, which a graph
-        # would freeze.
+        # would freeze. The pipeline-group query comes last so a thinker built
+        # without a vision tower or distributed state never reaches it.
         if (
             not self.multimodal_config.enable_mm_embeds
             and self.multimodal_config.mm_encoder_attn_dtype is None
             and self.multimodal_config.get_limit_per_prompt("image") > 0
-            and get_pp_group().is_first_rank
-            and self.visual.attn_backend
+            and getattr(self.visual, "attn_backend", None)
             in {
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.ROCM_AITER_FA,
                 AttentionBackendEnum.TRITON_ATTN,
             }
+            and get_pp_group().is_first_rank
         ):
             self.supports_encoder_cudagraph = True
 
