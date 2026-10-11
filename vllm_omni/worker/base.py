@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import time
 from contextlib import AbstractContextManager, nullcontext
@@ -221,51 +222,43 @@ class OmniGPUWorkerBase(GPUWorker):
 
         Same guidance upstream ``GPUWorker.determine_available_memory`` prints:
         a stage tuned before the reserve existed keeps its effective KV size by
-        raising ``gpu_memory_utilization`` by the graph pool's share. That trade
-        only exists while the budget follows the utilization; when
-        ``request_memory_tolerant`` capped it to the free memory, which is the
-        normal case for co-located Omni stages, raising the value buys nothing
-        and the log says so instead.
+        raising ``gpu_memory_utilization`` by the graph pool's share. That only
+        works while the raised budget still fits in the memory free at startup.
+        Otherwise ``request_memory_tolerant`` caps it to the free memory, the
+        normal case for co-located Omni stages, and the log says the previous
+        size cannot be restored.
         """
         if cudagraph_memory_estimate <= 0:
             return
+        total = self.init_snapshot.total_memory
+        free = self.init_snapshot.free_memory
         current_util = self.cache_config.gpu_memory_utilization
-        uncapped_memory = self.init_snapshot.total_memory * current_util
-        if self.requested_memory < uncapped_memory:
+        # Round up so the suggested value restores at least the reserved amount.
+        # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
+        scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)
+        suggested_util = math.ceil(scaled) / 10_000
+        # request_memory_tolerant computes the budget the suggested value would get.
+        suggested_memory = math.ceil(total * suggested_util)
+        uncapped = self.requested_memory >= math.ceil(total * current_util)
+        if uncapped and suggested_memory <= free:
             logger.info_once(
-                "Reserved %s GiB for CUDA graphs out of this stage's KV budget. The budget is "
-                "capped to the free memory on the device, not to --gpu-memory-utilization=%.4f, "
-                "so raising that value does not restore it; free memory on the device, or set "
+                "Reserved %s GiB for CUDA graphs out of this stage's KV budget; raise "
+                "--gpu-memory-utilization from %.4f to %.4f to keep the previous KV size, or set "
                 "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to leave the graph pool unreserved.",
                 format_gib(cudagraph_memory_estimate),
                 current_util,
-                scope="local",
-            )
-            return
-        util_delta = cudagraph_memory_estimate / self.init_snapshot.total_memory
-        equivalent_util = max(round(current_util - util_delta, 4), 0.0)
-        suggested_util = round(current_util + util_delta, 4)
-        if suggested_util > 1.0:
-            logger.info_once(
-                "Reserved %s GiB for CUDA graphs. --gpu-memory-utilization=%.4f now leaves the KV "
-                "cache what %.4f left before the reserve, and no utilization restores the previous "
-                "size: the pool is %.4f of the device. Set "
-                "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to leave it unreserved.",
-                format_gib(cudagraph_memory_estimate),
-                current_util,
-                equivalent_util,
-                round(util_delta, 4),
+                suggested_util,
                 scope="local",
             )
             return
         logger.info_once(
-            "Reserved %s GiB for CUDA graphs. --gpu-memory-utilization=%.4f now leaves the KV "
-            "cache what %.4f left before the reserve; raise it to %.4f to keep the previous KV "
-            "size, or set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to disable the reserve.",
+            "Reserved %s GiB for CUDA graphs out of this stage's KV budget; no "
+            "--gpu-memory-utilization restores the previous KV size, because the budget it needs "
+            "(%s GiB) exceeds the %s GiB free on the device at startup. Free memory on the device, "
+            "or set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to leave the graph pool unreserved.",
             format_gib(cudagraph_memory_estimate),
-            current_util,
-            equivalent_util,
-            suggested_util,
+            format_gib(suggested_memory if uncapped else self.requested_memory + cudagraph_memory_estimate),
+            format_gib(free),
             scope="local",
         )
 

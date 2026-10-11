@@ -12,6 +12,7 @@ Workers are constructed via ``object.__new__`` with only the attributes each
 method reads; module-level collaborators are monkeypatched. Pure CPU.
 """
 
+import math
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
@@ -67,8 +68,8 @@ def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model
         model_memory_usage=model_memory_usage,
     )
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE))
-    # total_memory is read only by the graph-reserve guidance log; memory_profiling is faked.
-    worker.init_snapshot = SimpleNamespace(total_memory=40 * GIB)
+    # Read only by the graph-reserve guidance log; memory_profiling is faked.
+    worker.init_snapshot = SimpleNamespace(total_memory=40 * GIB, free_memory=40 * GIB)
     # Not capped: the guidance branch that trades the reserve against
     # utilization only applies when the budget follows it.
     worker.requested_memory = requested_memory
@@ -219,9 +220,43 @@ def test_reserving_graph_memory_tells_the_operator_how_to_restore_the_budget(mon
         worker.determine_available_memory()
 
     message = "\n".join(record.getMessage() for record in caplog.records)
-    # 4 GiB of a 40 GiB device is 0.1 of the utilization fraction, so 0.8 goes to
-    # 0.9 to restore the budget and 0.7 is what it now behaves like.
-    assert "raise it to 0.9000" in message and "0.7000 left before" in message
+    # 4 GiB of a 40 GiB device is 0.1 of the utilization fraction, so 0.8 goes to 0.9.
+    assert "from 0.8000 to 0.9000" in message
+    assert message.count("Reserved") == 1
+
+
+def _reserve_message(monkeypatch, caplog, *, utilization, free, estimate=4 * GIB, requested=None):
+    total = 40 * GIB
+    worker = _make_worker(requested_memory=requested or math.ceil(total * utilization), model_memory_usage=10 * GIB)
+    worker.cache_config.gpu_memory_utilization = utilization
+    worker.init_snapshot.free_memory = free
+    worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    worker.model_runner.profile_cudagraph_memory = lambda: estimate
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    with caplog.at_level("INFO", logger=base.logger.name):
+        worker.determine_available_memory()
+    return "\n".join(record.getMessage() for record in caplog.records)
+
+
+def test_a_suggestion_the_free_memory_would_cap_is_not_offered(monkeypatch, caplog):
+    """The current 32 GiB budget fits in 33 GiB free, but 0.9 of 40 GiB would be
+    capped to 33 GiB, i.e. 29 GiB after the reserve instead of the previous 32."""
+    message = _reserve_message(monkeypatch, caplog, utilization=0.8, free=33 * GIB)
+    assert "no --gpu-memory-utilization restores the previous KV size" in message
+    assert "raise --gpu-memory-utilization" not in message
+
+
+def test_a_suggestion_that_exactly_fits_the_free_memory_is_offered(monkeypatch, caplog):
+    message = _reserve_message(monkeypatch, caplog, utilization=0.8, free=36 * GIB)
+    assert "from 0.8000 to 0.9000" in message
+
+
+def test_a_pool_larger_than_the_utilization_headroom_is_not_restorable(monkeypatch, caplog):
+    # 0.95 + 0.1 would exceed the whole device.
+    message = _reserve_message(monkeypatch, caplog, utilization=0.95, free=40 * GIB)
+    assert "no --gpu-memory-utilization restores the previous KV size" in message
 
 
 def test_disabling_the_reserve_skips_the_graph_profile(monkeypatch, caplog):
@@ -297,8 +332,8 @@ def test_a_capped_budget_is_not_told_to_raise_utilization(monkeypatch, caplog):
 
     message = "\n".join(record.getMessage() for record in caplog.records)
     assert budget == 13 * GIB
-    assert "capped to the free memory" in message
-    assert "raise it to" not in message
+    assert "no --gpu-memory-utilization restores the previous KV size" in message
+    assert "raise --gpu-memory-utilization" not in message
 
 
 def test_determine_available_memory_kv_cache_short_circuit(monkeypatch):
