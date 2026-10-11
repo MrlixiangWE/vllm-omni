@@ -43,7 +43,7 @@ The total memory used by a stage includes:
 When a stage captures CUDA graphs, the pool the runner captures through its
 CUDA-graph dispatcher is profiled during startup and subtracted from the KV cache
 budget, so `gpu_memory_utilization` covers those graphs as well. Set
-`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` to leave it unreserved. A stage tuned
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` to skip that profiling pass and leave the pool unreserved. A stage tuned
 before this reserve existed keeps its previous KV cache size by raising
 `gpu_memory_utilization` by the graph pool's share of the device; the startup log
 prints the value to use, and says so when the budget was capped to the free memory

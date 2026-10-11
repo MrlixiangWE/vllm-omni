@@ -129,9 +129,15 @@ class OmniGPUWorkerBase(GPUWorker):
                to stay outside the ``memory_profiling`` window above, because it
                allocates a minimal KV cache and captures graphs of its own,
                which would otherwise land in ``non_torch_increase`` and be
-               counted twice. The estimate enters the budget only when
+               counted twice. It runs only when
                VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS is enabled (it is by
-               default). Graphs captured outside that dispatcher are not in it:
+               default), and the estimate is clamped at zero: it comes from
+               device free-memory deltas, so a release elsewhere on the device
+               during capture must not raise the budget above the request.
+               Under ``parallel_stage_init`` this runs inside the profiling
+               ``LOCK_EX`` (``engine/stage_phase_lock``), so co-located stages
+               cannot allocate or capture meanwhile. Graphs captured outside
+               that dispatcher are not in it:
                ``GPUARModelRunner.capture_model`` captures the talker MTP graphs
                after ``super().capture_model()``, and model
                ``capture_auxiliary_graphs`` hooks run after warmup. Under
@@ -140,7 +146,7 @@ class OmniGPUWorkerBase(GPUWorker):
                for them.
 
             4. profiled_usage = the step 2 measurements +
-               cudagraph_memory_estimate_applied
+               cudagraph_memory_estimate
 
             5. available_kv_cache = requested_memory - profiled_usage
 
@@ -167,13 +173,11 @@ class OmniGPUWorkerBase(GPUWorker):
 
         cudagraph_memory_estimate = 0
         if (
-            current_omni_platform.is_cuda_alike()
+            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            and current_omni_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
-            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS else 0
-        )
+            cudagraph_memory_estimate = max(0, self.model_runner.profile_cudagraph_memory())
 
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
         self.non_torch_memory = profile_result.non_torch_increase
@@ -192,7 +196,7 @@ class OmniGPUWorkerBase(GPUWorker):
             int(self.model_runner.model_memory_usage)
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
-            + cudagraph_memory_estimate_applied
+            + cudagraph_memory_estimate
         )
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
@@ -227,32 +231,6 @@ class OmniGPUWorkerBase(GPUWorker):
             return
         current_util = self.cache_config.gpu_memory_utilization
         uncapped_memory = self.init_snapshot.total_memory * current_util
-        if not envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-            if self.requested_memory < uncapped_memory:
-                logger.warning_once(
-                    "CUDA graph memory is not reserved (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): "
-                    "%s GiB of graph pool is allocated on top of this stage's capped budget. "
-                    "Re-enable the reserve or free memory on the device to leave room for the pool; "
-                    "the budget is capped to free memory, so raising --gpu-memory-utilization "
-                    "does not create room.",
-                    format_gib(cudagraph_memory_estimate),
-                    scope="local",
-                )
-            else:
-                equivalent_util = max(
-                    round(current_util - cudagraph_memory_estimate / self.init_snapshot.total_memory, 4), 0.0
-                )
-                logger.warning_once(
-                    "CUDA graph memory is not reserved (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0): %s GiB "
-                    "of graph pool is allocated on top of this stage's budget, so it exceeds "
-                    "--gpu-memory-utilization=%.4f. Re-enable the reserve, or lower the value to %.4f "
-                    "to leave room for the pool.",
-                    format_gib(cudagraph_memory_estimate),
-                    current_util,
-                    equivalent_util,
-                    scope="local",
-                )
-            return
         if self.requested_memory < uncapped_memory:
             logger.info_once(
                 "Reserved %s GiB for CUDA graphs out of this stage's KV budget. The budget is "
