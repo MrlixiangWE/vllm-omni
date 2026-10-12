@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
@@ -47,6 +48,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
     partition_payload_list,
@@ -563,8 +565,65 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def capture_model(self) -> int:
         result = super().capture_model()
+        if not self._has_talker_mtp_graphs():
+            return result
+        torch.accelerator.synchronize()
+        free_before = torch.accelerator.get_memory_info()[0]
         self._capture_talker_mtp_graphs()
-        return result
+        torch.accelerator.synchronize()
+        # Report the MTP pool with the rest so the worker compares it against
+        # profile_cudagraph_memory(), which includes it.
+        return result + max(free_before - torch.accelerator.get_memory_info()[0], 0)
+
+    def _has_talker_mtp_graphs(self) -> bool:
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        return bool(self.has_talker_mtp) and isinstance(self.talker_mtp, CUDAGraphWrapper)
+
+    @torch.inference_mode()
+    def profile_cudagraph_memory(self) -> int:
+        # Upstream captures the dispatcher's graphs. For models with a talker,
+        # _dummy_run also runs talker_mtp, so the FULL sizes include its graphs;
+        # capture_model() adds the remaining sizes afterwards. Measure those.
+        return super().profile_cudagraph_memory() + self._profile_talker_mtp_graph_memory()
+
+    def _profile_talker_mtp_graph_memory(self) -> int:
+        """Capture the talker MTP graphs into a throwaway pool and return their size.
+
+        The capture needs the dispatcher keys that only exist while a KV cache
+        is initialized, so this opens its own minimal profiling KV cache and
+        tears it down the way upstream ``profile_cudagraph_memory`` does.
+        """
+        from vllm.compilation.counter import compilation_counter
+        from vllm.config import set_current_vllm_config
+
+        if not self._has_talker_mtp_graphs():
+            return 0
+
+        wrapper = self.talker_mtp
+        original_pool = wrapper.graph_pool
+        saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+        try:
+            wrapper.graph_pool = current_omni_platform.graph_pool_handle()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+            free_before = torch.accelerator.get_memory_info()[0]
+            self._capture_talker_mtp_graphs(skip_full=getattr(self.model, "talker", None) is not None)
+            torch.accelerator.synchronize()
+            estimate = max(free_before - torch.accelerator.get_memory_info()[0], 0)
+        finally:
+            wrapper.clear_graphs()
+            wrapper.graph_pool = original_pool
+            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+                key_set.clear()
+            self.cudagraph_dispatcher.keys_initialized = False
+            self._cleanup_profiling_kv_cache()
+            torch.accelerator.empty_cache()
+        logger.info("Estimated talker MTP CUDA graph memory: %s GiB", format_gib(estimate))
+        return estimate
 
     def shutdown(self) -> None:
         """Release omni-specific GPU resources before upstream shutdown.
@@ -631,10 +690,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # 7. Delegate to upstream shutdown (model = None, KV caches, workspace).
         super().shutdown()
 
-    def _capture_talker_mtp_graphs(self) -> None:
-        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    def _capture_talker_mtp_graphs(self, skip_full: bool = False) -> None:
+        """Capture the talker MTP graph for every capture size.
 
-        if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
+        ``skip_full`` leaves out the sizes that dispatch to FULL graphs, which
+        ``_dummy_run`` has already captured with the decoder.
+        """
+        if not self._has_talker_mtp_graphs():
             return
 
         from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -645,17 +707,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         capture_sizes = sorted(capture_sizes, reverse=True)
         logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
 
+        captured = 0
         set_cudagraph_capturing_enabled(True)
         try:
             with torch.inference_mode(), graph_capture(device=self.device):
                 for bsz in capture_sizes:
-                    _, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+                    runtime_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
                         num_tokens=bsz,
                         num_reqs=bsz,
                         num_scheduled_tokens_np=np.ones(bsz, dtype=np.int32),
                         max_num_scheduled_tokens=1,
                         use_cascade_attn=False,
                     )
+                    if skip_full and runtime_mode == CUDAGraphMode.FULL:
+                        continue
                     n = batch_desc.num_tokens
                     ids = self.talker_mtp_input_ids.gpu[:n]
                     emb = self.talker_mtp_inputs_embeds.gpu[:n]
@@ -679,8 +744,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     ):
                         self.talker_mtp(ids, emb, hid, ts)
                     torch.accelerator.synchronize()
+                    captured += 1
 
-            logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
+            logger.info("Captured talker_mtp graphs for %d sizes", captured)
         except RuntimeError as e:
             raise RuntimeError(
                 f"talker_mtp graph capture failed for a model that declared talker_mtp_graph_safe=True: {e}"
