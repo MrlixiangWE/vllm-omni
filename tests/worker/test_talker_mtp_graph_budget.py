@@ -10,6 +10,7 @@ compares with the estimate. Runners are built with ``object.__new__``; device
 memory is faked. Pure CPU.
 """
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ from vllm.forward_context import BatchDescriptor
 
 import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as OmniV1Runner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as OmniV2Runner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -236,6 +238,21 @@ def test_capture_without_a_talker_expects_no_graphs_from_the_decoder(monkeypatch
     assert calls == [4, 4, 2, 2, 1, 1]
     assert ("INFO", "Captured talker_mtp graphs for 3 sizes (0 already captured)") in records
     assert not [message for level, message in records if level == "WARNING"]
+
+
+@pytest.mark.parametrize(
+    ("has_talker", "has_talker_mtp", "expected"),
+    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+)
+def test_profiling_and_dummy_run_share_one_talker_mtp_predicate(has_talker, has_talker_mtp, expected):
+    """skip_full is right only while it matches the condition under which
+    _dummy_run runs talker_mtp; both read the base runner's helper."""
+    assert "_talker_mtp_runs_in_dummy_run" not in GPUARModelRunner.__dict__
+    assert "self._talker_mtp_runs_in_dummy_run()" in inspect.getsource(OmniV1Runner._dummy_run)
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(talker=object()) if has_talker else SimpleNamespace()
+    runner.has_talker_mtp = has_talker_mtp
+    assert runner._talker_mtp_runs_in_dummy_run() is expected
 
 
 def _make_v2_runner(monkeypatch, device_memory, *, decoder_size, mtp_size):

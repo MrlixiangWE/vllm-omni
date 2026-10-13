@@ -48,7 +48,7 @@ before this reserve existed keeps its previous KV cache size by raising
 `gpu_memory_utilization` by the graph pool's share of the device. The startup log
 prints the value to use when the raised budget still fits in the memory free at
 startup, and otherwise says that no value restores the previous size, for example
-when co-located stages already hold part of the device. The reserve also covers the
+when co-located stages already hold part of the device. On CUDA and ROCm, the reserve also covers the
 talker MTP graphs, which are profiled with the rest, and, on stages that size a KV
 cache, the graphs of models that implement both `capture_auxiliary_graphs` and
 `release_auxiliary_graphs`, which are captured once while profiling, released, and

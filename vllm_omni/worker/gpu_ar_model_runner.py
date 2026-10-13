@@ -587,10 +587,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # capture_model() adds the remaining sizes afterwards. Measure those.
         return super().profile_cudagraph_memory() + self._profile_talker_mtp_graph_memory()
 
-    def _talker_mtp_runs_in_dummy_run(self) -> bool:
-        # Mirrors the condition under which _dummy_run calls talker_mtp.
-        return getattr(self.model, "talker", None) is not None and bool(self.has_talker_mtp)
-
     def _profile_talker_mtp_graph_memory(self) -> int:
         """Capture the talker MTP graphs into a throwaway pool and return their size.
 
