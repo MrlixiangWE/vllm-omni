@@ -587,12 +587,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # capture_model() adds the remaining sizes afterwards. Measure those.
         return super().profile_cudagraph_memory() + self._profile_talker_mtp_graph_memory()
 
+    def _talker_mtp_runs_in_dummy_run(self) -> bool:
+        # Mirrors the condition under which _dummy_run calls talker_mtp.
+        return getattr(self.model, "talker", None) is not None and bool(self.has_talker_mtp)
+
     def _profile_talker_mtp_graph_memory(self) -> int:
         """Capture the talker MTP graphs into a throwaway pool and return their size.
 
         The capture needs the dispatcher keys that only exist while a KV cache
         is initialized, so this opens its own minimal profiling KV cache and
         tears it down the way upstream ``profile_cudagraph_memory`` does.
+
+        At runtime the MTP graphs share the global graph pool with the decoder
+        graphs, so adding this separate-pool size to upstream's estimate is an
+        upper bound: the reserve exceeds the actual pool by whatever the two
+        would share.
         """
         from vllm.compilation.counter import compilation_counter
         from vllm.config import set_current_vllm_config
@@ -610,7 +619,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             free_before = torch.accelerator.get_memory_info()[0]
-            self._capture_talker_mtp_graphs(skip_full=getattr(self.model, "talker", None) is not None)
+            self._capture_talker_mtp_graphs(skip_full=self._talker_mtp_runs_in_dummy_run())
             torch.accelerator.synchronize()
             estimate = max(free_before - torch.accelerator.get_memory_info()[0], 0)
         finally:
@@ -694,7 +703,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """Capture the talker MTP graph for every capture size.
 
         ``skip_full`` leaves out the sizes that dispatch to FULL graphs, which
-        ``_dummy_run`` has already captured with the decoder.
+        ``_dummy_run`` captures with the decoder. Sizes whose graph already
+        exists are not run again.
         """
         if not self._has_talker_mtp_graphs():
             return
@@ -707,7 +717,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         capture_sizes = sorted(capture_sizes, reverse=True)
         logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
 
+        entries = self.talker_mtp.concrete_cudagraph_entries
         captured = 0
+        existing = 0
+        # FULL sizes the profiling pass left to _dummy_run but that it did not
+        # capture, so the KV cache budget does not include them.
+        unbudgeted: list[int] = []
         set_cudagraph_capturing_enabled(True)
         try:
             with torch.inference_mode(), graph_capture(device=self.device):
@@ -721,6 +736,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                     if skip_full and runtime_mode == CUDAGraphMode.FULL:
                         continue
+                    if batch_desc in entries:
+                        existing += 1
+                        continue
+                    if runtime_mode == CUDAGraphMode.FULL and self._talker_mtp_runs_in_dummy_run():
+                        unbudgeted.append(bsz)
                     n = batch_desc.num_tokens
                     ids = self.talker_mtp_input_ids.gpu[:n]
                     emb = self.talker_mtp_inputs_embeds.gpu[:n]
@@ -746,7 +766,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     torch.accelerator.synchronize()
                     captured += 1
 
-            logger.info("Captured talker_mtp graphs for %d sizes", captured)
+            logger.info("Captured talker_mtp graphs for %d sizes (%d already captured)", captured, existing)
+            if unbudgeted:
+                logger.warning(
+                    "talker_mtp graphs for FULL sizes %s were not captured with the decoder graphs; "
+                    "the KV cache budget does not include them",
+                    unbudgeted,
+                )
         except RuntimeError as e:
             raise RuntimeError(
                 f"talker_mtp graph capture failed for a model that declared talker_mtp_graph_safe=True: {e}"

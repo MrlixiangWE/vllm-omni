@@ -20,6 +20,7 @@ import vllm.v1.worker.gpu_model_runner as upstream_v1
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
 
 import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -159,8 +160,7 @@ class _RecordingWrapper(CUDAGraphWrapper):
         self.calls.append(ids.shape[0])
 
 
-@pytest.mark.parametrize("skip_full, expected", [(False, [4, 4, 2, 2, 1, 1]), (True, [4, 4])])
-def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_full, expected):
+def _make_capture_runner(monkeypatch, *, model=None, entries=()):
     """Sizes 1 and 2 dispatch to FULL graphs here, size 4 does not."""
     import vllm.compilation.monitor as monitor
     import vllm.distributed.parallel_state as parallel_state
@@ -168,8 +168,10 @@ def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_fu
     runner = object.__new__(GPUARModelRunner)
     wrapper = object.__new__(_RecordingWrapper)
     wrapper.calls = []
+    wrapper.concrete_cudagraph_entries = {BatchDescriptor(num_tokens=n): object() for n in entries}
     runner.talker_mtp = wrapper
     runner.has_talker_mtp = True
+    runner.model = model if model is not None else SimpleNamespace()
     runner.device = "cpu"
     runner.vllm_config = SimpleNamespace()
     runner.compilation_config = SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4], cudagraph_num_of_warmups=1)
@@ -178,18 +180,62 @@ def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_fu
 
     def dispatch(*, num_tokens, **kwargs):
         mode = CUDAGraphMode.FULL if num_tokens <= 2 else CUDAGraphMode.PIECEWISE
-        return mode, SimpleNamespace(num_tokens=num_tokens), False, None, None
+        return mode, BatchDescriptor(num_tokens=num_tokens), False, None, None
 
     runner._determine_batch_execution_and_padding = dispatch
     monkeypatch.setattr(parallel_state, "graph_capture", lambda device: _NullContext())
     monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda enabled: None)
     monkeypatch.setattr(ar_runner_module, "set_forward_context", lambda *args, **kwargs: _NullContext())
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    return runner, wrapper
+
+
+@pytest.mark.parametrize("skip_full, expected", [(False, [4, 4, 2, 2, 1, 1]), (True, [4, 4])])
+def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_full, expected):
+    runner, wrapper = _make_capture_runner(monkeypatch)
 
     runner._capture_talker_mtp_graphs(skip_full=skip_full)
 
     # One warmup and one capture per size, largest first.
     assert wrapper.calls == expected
+
+
+def _capture_log(monkeypatch, caplog, **kwargs):
+    runner, wrapper = _make_capture_runner(monkeypatch, **kwargs)
+    with caplog.at_level("INFO", logger=ar_runner_module.logger.name):
+        runner._capture_talker_mtp_graphs()
+    return wrapper.calls, [(record.levelname, record.getMessage()) for record in caplog.records]
+
+
+def test_capture_leaves_the_graphs_captured_with_the_decoder_alone(monkeypatch, caplog):
+    """With a talker, _dummy_run captures the MTP inside the FULL decoder
+    graphs; the real capture neither runs nor counts those sizes again."""
+    calls, records = _capture_log(monkeypatch, caplog, model=SimpleNamespace(talker=object()), entries=(1, 2))
+
+    assert calls == [4, 4]
+    assert ("INFO", "Captured talker_mtp graphs for 1 sizes (2 already captured)") in records
+    assert not [message for level, message in records if level == "WARNING"]
+
+
+def test_capture_warns_about_a_full_size_the_decoder_capture_missed(monkeypatch, caplog):
+    """Profiling skipped size 2 because it dispatches to FULL, so a new graph
+    there is outside the budget."""
+    calls, records = _capture_log(monkeypatch, caplog, model=SimpleNamespace(talker=object()), entries=(1,))
+
+    assert calls == [4, 4, 2, 2]
+    assert ("INFO", "Captured talker_mtp graphs for 2 sizes (1 already captured)") in records
+    warnings = [message for level, message in records if level == "WARNING"]
+    assert len(warnings) == 1 and "FULL sizes [2]" in warnings[0]
+
+
+def test_capture_without_a_talker_expects_no_graphs_from_the_decoder(monkeypatch, caplog):
+    """Without a talker, _dummy_run never runs the MTP and profiling measured
+    every size, so the FULL sizes are captured here without a warning."""
+    calls, records = _capture_log(monkeypatch, caplog)
+
+    assert calls == [4, 4, 2, 2, 1, 1]
+    assert ("INFO", "Captured talker_mtp graphs for 3 sizes (0 already captured)") in records
+    assert not [message for level, message in records if level == "WARNING"]
 
 
 def _make_v2_runner(monkeypatch, device_memory, *, decoder_size, mtp_size):
