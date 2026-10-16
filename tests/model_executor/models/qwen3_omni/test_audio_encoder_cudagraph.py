@@ -169,9 +169,19 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
 
 @pytest.mark.parametrize(
     "change",
-    ["no_audio_limit", "sdpa_backend", "data_parallel", "budget_below_one_chunk", "embeds", "model_runner_v2", None],
+    [
+        "no_audio_limit",
+        "sdpa_backend",
+        "fp8_attention",
+        "later_pipeline_rank",
+        "data_parallel",
+        "budget_below_one_chunk",
+        "embeds",
+        "model_runner_v2",
+        None,
+    ],
 )
-def test_audio_graph_gate(change):
+def test_audio_graph_gate(monkeypatch, change):
     cfg = _config()
     thinker = _thinker(cfg)
     thinker.audio_tower = _tower()
@@ -180,6 +190,10 @@ def test_audio_graph_gate(change):
         mm.get_limit_per_prompt = lambda modality: 0 if modality == "audio" else 4
     elif change == "sdpa_backend":
         thinker.audio_tower.attn_backend = AttentionBackendEnum.TORCH_SDPA
+    elif change == "fp8_attention":
+        mm.mm_encoder_attn_dtype = "fp8"
+    elif change == "later_pipeline_rank":
+        monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     elif change == "data_parallel":
         mm.mm_encoder_tp_mode = "data"
     elif change == "budget_below_one_chunk":
