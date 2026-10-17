@@ -116,6 +116,7 @@ _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
     "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",

@@ -363,3 +363,29 @@ def test_audio_budgets_stop_at_one_attention_window():
     explicit = _cpu_manager(_audio_thinker(budgets=(2, 4, 8, 16)))
     assert explicit.path_token_budgets["audio"] == [0, 2, 4, 8]
     assert explicit.path_token_budgets["default"] == [0, 2, 4, 8, 16]
+
+
+@pytest.mark.parametrize(
+    "budgets, audio",
+    [
+        # One large budget to keep graph memory small captures one audio graph.
+        ((16,), [0, 8]),
+        # Each budget rounds down to whole chunks; duplicates collapse.
+        ((3, 5, 16), [0, 2, 4, 8]),
+        ((3, 7, 9), [0, 2, 6, 8]),
+    ],
+)
+def test_explicit_budgets_set_the_audio_budgets(budgets, audio):
+    manager = _cpu_manager(_audio_thinker(budgets=budgets))
+    assert manager.path_token_budgets["audio"] == audio
+    assert manager.path_token_budgets["default"] == [0, *sorted(budgets)]
+    # A clip that fills the largest audio budget (16 frames per 2-token chunk) replays.
+    assert manager.execute(_audio([16 * (audio[-1] // 2)])) is not None
+
+
+def test_audio_output_lengths_accept_python_ints():
+    # Host metadata and item specs pass plain ints to the upstream helper.
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import _get_feat_extract_output_lengths
+
+    for length in range(1, 3001):
+        assert _get_feat_extract_output_lengths(length) == int(_get_feat_extract_output_lengths(torch.tensor(length)))

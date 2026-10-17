@@ -205,8 +205,8 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
                 manager.capture(graph_pool=torch.cuda.graph_pool_handle())
             finally:
                 set_cudagraph_capturing_enabled(False)
-        # The audio path doubles from one chunk (13 tokens) up to the largest budget.
-        assert manager.path_token_budgets == {"audio": [13, 26, 52]}
+        # Explicit budgets set the audio budgets (whole 13-token chunks).
+        assert manager.path_token_budgets == {"audio": [13, 52]}
         # One full chunk filling the smallest budget; a tail chunk padded to a
         # larger budget; two clips in one replay; four chunks filling a budget.
         cases = [[100], [250], [100, 150], [400]]

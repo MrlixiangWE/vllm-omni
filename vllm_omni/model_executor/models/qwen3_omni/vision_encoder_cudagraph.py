@@ -154,6 +154,16 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         tower = self.audio_tower
         return self._audio_tokens_per_chunk() * (tower.n_window_infer // (tower.n_window * 2))
 
+    def get_encoder_cudagraph_path_budgets(self, path: str, user_budgets: list[int]) -> list[int] | None:
+        """Budgets for one path from an explicit encoder_cudagraph_token_budgets; None keeps the manager's."""
+        if path != _AUDIO_PATH:
+            return None
+        # Audio graphs fill whole chunks, so each listed budget rounds down to
+        # whole chunks and stops at one attention window.
+        per_chunk = self._audio_tokens_per_chunk()
+        cap = self.get_encoder_cudagraph_path_max_budget(path)
+        return sorted({min(budget // per_chunk * per_chunk, cap) for budget in user_budgets if budget >= per_chunk})
+
     def encoder_cudagraph_group_eligible(self, mm_kwargs: dict[str, Any]) -> bool:
         """Whether a graph reproduces the eager result for this group.
 
@@ -183,7 +193,7 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             return [
                 EncoderItemSpec(
                     input_size=length,
-                    output_tokens=int(_get_feat_extract_output_lengths(torch.tensor(length))),
+                    output_tokens=int(_get_feat_extract_output_lengths(length)),
                     path_output_tokens={_AUDIO_PATH: per_chunk * -(-length // chunk_size)},
                 )
                 for length in self._audio_lengths(mm_kwargs)

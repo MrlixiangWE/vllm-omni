@@ -86,8 +86,9 @@ clips, replay together when one captured graph holds them all; otherwise they
 run through the eager encoder in one call, as do audio clips that are all
 shorter than one second. Set `encoder_cudagraph_token_budgets`
 and `encoder_cudagraph_max_vision_items_per_batch` in the same
-`compilation_config` to change them (audio budgets stay at or below 104
-tokens); each captured budget adds graph memory on the thinker's GPU.
+`compilation_config` to change them (for audio, each listed budget rounds down
+to whole 13-token chunks and stops at 104 tokens); each captured budget adds
+graph memory on the thinker's GPU.
 
 ### Stage-based launch (one stage per process)
 

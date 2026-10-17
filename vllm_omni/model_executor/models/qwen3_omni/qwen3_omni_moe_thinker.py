@@ -452,7 +452,7 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
             length = int(length)
             num_chunks = -(-length // chunk_size)
             chunk_lengths += [chunk_size] * (num_chunks - 1) + [length - chunk_size * (num_chunks - 1)]
-            aftercnn_lens.append(int(_get_feat_extract_output_lengths(torch.tensor(length))))
+            aftercnn_lens.append(int(_get_feat_extract_output_lengths(length)))
         chunk_lens_after_cnn = self._get_cnn_output_lengths(np.asarray(chunk_lengths, dtype=np.int64))
         max_len_after_cnn = int(chunk_lens_after_cnn.max())
 
