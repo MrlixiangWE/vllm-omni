@@ -19,6 +19,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderItemSpec,
 )
 
+from vllm_omni.platforms import current_omni_platform
+
 _FLASH_BACKENDS = {
     AttentionBackendEnum.FLASH_ATTN,
     AttentionBackendEnum.ROCM_AITER_FA,
@@ -105,6 +107,8 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             reason = "model runner v2 is in use"
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"
+        elif not current_omni_platform.is_cuda():
+            reason = "audio encoder graphs are validated on CUDA only"
         elif getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
             reason = f"the audio attention backend is {getattr(audio_tower, 'attn_backend', None)}"
         elif self._max_encoder_cudagraph_budget(vllm_config) < self._audio_tokens_per_chunk():

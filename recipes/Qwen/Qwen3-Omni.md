@@ -88,7 +88,7 @@ shorter than one second. Set `encoder_cudagraph_token_budgets`
 and `encoder_cudagraph_max_vision_items_per_batch` in the same
 `compilation_config` to change them (for audio, each listed budget rounds down
 to whole 13-token chunks and stops at 104 tokens); each captured budget adds
-graph memory on the thinker's GPU. Audio stays eager with model runner v2,
+graph memory on the thinker's GPU. Audio graphs are CUDA only; audio also stays eager with model runner v2,
 with `mm_encoder_tp_mode: data`, and when no listed budget reaches 13 tokens;
 to keep the image graphs and run audio eagerly in other setups, start with
 

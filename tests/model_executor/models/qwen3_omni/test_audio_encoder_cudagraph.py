@@ -40,6 +40,8 @@ N_WINDOW, N_WINDOW_INFER, MEL = 8, 64, 8
 @pytest.fixture(autouse=True)
 def _first_pipeline_rank(monkeypatch):
     monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    # Audio graphs are CUDA only; these CPU tests stand in for a CUDA platform unless a case changes it.
+    monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: True))
     # The tiny tower uses its own chunk size; production lengths assume 100-frame chunks.
     monkeypatch.setattr(
         graph_module,
@@ -181,6 +183,7 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
         "opted_out",
         "opted_out_as_string",
         "rocm_aiter_backend",
+        "rocm_platform",
         None,
     ],
 )
@@ -211,6 +214,9 @@ def test_audio_graph_gate(monkeypatch, change):
         cfg.additional_config = {"audio_encoder_cudagraph": "false"}
     elif change == "rocm_aiter_backend":
         thinker.audio_tower.attn_backend = AttentionBackendEnum.ROCM_AITER_FA
+    elif change == "rocm_platform":
+        # ROCm returns FLASH_ATTN on CDNA without AITER and on RDNA, so the backend alone does not exclude it.
+        monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: False))
     thinker._enable_audio_encoder_cudagraph(cfg)
     assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is (change is None)
     # The image path stays enabled either way.
@@ -226,20 +232,28 @@ def test_unrecognised_audio_graph_setting_is_rejected():
         thinker._enable_audio_encoder_cudagraph(cfg)
 
 
-@pytest.mark.parametrize("graphs_on", [True, False])
-def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch, graphs_on):
+@pytest.mark.parametrize(
+    "graphs_on, case, reason",
+    [
+        (True, "data_parallel", "the multimodal encoder runs data parallel"),
+        (False, "data_parallel", None),
+        (True, "rocm", "audio encoder graphs are validated on CUDA only"),
+    ],
+)
+def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch, graphs_on, case, reason):
     cfg = _config()
     cfg.compilation_config.cudagraph_mm_encoder = graphs_on
     thinker = _thinker(cfg)
     thinker.audio_tower = _tower()
-    thinker.multimodal_config.mm_encoder_tp_mode = "data"
+    if case == "data_parallel":
+        thinker.multimodal_config.mm_encoder_tp_mode = "data"
+    else:
+        monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: False))
     logged = []
     monkeypatch.setattr(graph_module.logger, "info", lambda msg, *args: logged.append(msg % args))
     thinker._enable_audio_encoder_cudagraph(cfg)
     assert "audio" not in thinker.get_encoder_cudagraph_config().modalities
-    assert logged == (
-        ["Audio encoder CUDA graphs stay off: the multimodal encoder runs data parallel."] if graphs_on else []
-    )
+    assert logged == ([f"Audio encoder CUDA graphs stay off: {reason}."] if reason else [])
 
 
 def test_audio_replay_rejects_a_group_without_a_full_chunk():
