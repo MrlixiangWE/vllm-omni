@@ -88,7 +88,9 @@ shorter than one second. Set `encoder_cudagraph_token_budgets`
 and `encoder_cudagraph_max_vision_items_per_batch` in the same
 `compilation_config` to change them (for audio, each listed budget rounds down
 to whole 13-token chunks and stops at 104 tokens); each captured budget adds
-graph memory on the thinker's GPU.
+graph memory on the thinker's GPU. To keep the image graphs and run audio
+eagerly, set `audio_encoder_cudagraph: false` in the thinker stage's
+`additional_config`.
 
 ### Stage-based launch (one stage per process)
 

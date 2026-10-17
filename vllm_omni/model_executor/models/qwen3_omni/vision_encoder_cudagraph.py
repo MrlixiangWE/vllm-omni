@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-Omni image and audio encoder contract for the upstream CUDA graph manager."""
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from typing import Any
 
 import torch
@@ -26,6 +26,14 @@ _FLASH_BACKENDS = {
 # Images keep the path name they were captured under before audio existed.
 _IMAGE_PATH = "default"
 _AUDIO_PATH = "audio"
+
+
+def _audio_graphs_requested(vllm_config) -> bool:
+    """False when the stage's additional_config sets ``audio_encoder_cudagraph: false``."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, Mapping):
+        return True
+    return str(additional.get("audio_encoder_cudagraph", True)).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _pad_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -74,10 +82,12 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # encoder runs data parallel (the audio tower itself stays tensor
         # parallel there) and under model runner v2, which builds the upstream
         # manager and never consults encoder_cudagraph_group_eligible; and the
-        # largest budget must hold at least one audio chunk.
+        # largest budget must hold at least one audio chunk. The stage's
+        # additional_config can turn audio graphs off while images still replay.
         audio_tower = getattr(self, "audio_tower", None)
         if (
-            not getattr(vllm_config, "use_v2_model_runner", False)
+            _audio_graphs_requested(vllm_config)
+            and not getattr(vllm_config, "use_v2_model_runner", False)
             and not self.multimodal_config.enable_mm_embeds
             and self.multimodal_config.mm_encoder_attn_dtype is None
             and self.multimodal_config.get_limit_per_prompt("audio") > 0

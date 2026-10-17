@@ -178,6 +178,8 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
         "budget_below_one_chunk",
         "embeds",
         "model_runner_v2",
+        "opted_out",
+        "opted_out_as_string",
         None,
     ],
 )
@@ -202,10 +204,23 @@ def test_audio_graph_gate(monkeypatch, change):
         mm.enable_mm_embeds = True
     elif change == "model_runner_v2":
         cfg.use_v2_model_runner = True
+    elif change == "opted_out":
+        cfg.additional_config = {"audio_encoder_cudagraph": False}
+    elif change == "opted_out_as_string":
+        cfg.additional_config = {"audio_encoder_cudagraph": "false"}
     thinker._enable_audio_encoder_cudagraph(cfg)
     assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is (change is None)
     # The image path stays enabled either way.
     assert supports_encoder_cudagraph(thinker)
+
+
+def test_audio_graphs_stay_on_with_other_additional_config():
+    cfg = _config()
+    cfg.additional_config = {"audio_encoder_cudagraph": True, "unrelated": 1}
+    thinker = _thinker(cfg)
+    thinker.audio_tower = _tower()
+    thinker._enable_audio_encoder_cudagraph(cfg)
+    assert thinker.get_encoder_cudagraph_config().modalities == ["image", "audio"]
 
 
 def test_config_keeps_the_image_only_path_and_adds_an_audio_path():
