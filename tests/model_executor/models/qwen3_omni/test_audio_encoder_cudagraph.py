@@ -180,6 +180,7 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
         "model_runner_v2",
         "opted_out",
         "opted_out_as_string",
+        "rocm_aiter_backend",
         None,
     ],
 )
@@ -208,10 +209,43 @@ def test_audio_graph_gate(monkeypatch, change):
         cfg.additional_config = {"audio_encoder_cudagraph": False}
     elif change == "opted_out_as_string":
         cfg.additional_config = {"audio_encoder_cudagraph": "false"}
+    elif change == "rocm_aiter_backend":
+        thinker.audio_tower.attn_backend = AttentionBackendEnum.ROCM_AITER_FA
     thinker._enable_audio_encoder_cudagraph(cfg)
     assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is (change is None)
     # The image path stays enabled either way.
     assert supports_encoder_cudagraph(thinker)
+
+
+def test_unrecognised_audio_graph_setting_is_rejected():
+    cfg = _config()
+    cfg.additional_config = {"audio_encoder_cudagraph": "disabled"}
+    thinker = _thinker(cfg)
+    thinker.audio_tower = _tower()
+    with pytest.raises(ValueError, match="audio_encoder_cudagraph"):
+        thinker._enable_audio_encoder_cudagraph(cfg)
+
+
+@pytest.mark.parametrize("graphs_on", [True, False])
+def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch, graphs_on):
+    cfg = _config()
+    cfg.compilation_config.cudagraph_mm_encoder = graphs_on
+    thinker = _thinker(cfg)
+    thinker.audio_tower = _tower()
+    thinker.multimodal_config.mm_encoder_tp_mode = "data"
+    logged = []
+    monkeypatch.setattr(graph_module.logger, "info", lambda msg, *args: logged.append(msg % args))
+    thinker._enable_audio_encoder_cudagraph(cfg)
+    assert "audio" not in thinker.get_encoder_cudagraph_config().modalities
+    assert logged == (
+        ["Audio encoder CUDA graphs stay off: the multimodal encoder runs data parallel."] if graphs_on else []
+    )
+
+
+def test_audio_replay_rejects_a_group_without_a_full_chunk():
+    thinker = _audio_thinker()
+    with pytest.raises(ValueError, match="full-length chunk"):
+        thinker.prepare_encoder_cudagraph_replay_buffers(_audio([5, 9]), 2, 0, "audio")
 
 
 def test_audio_graphs_stay_on_with_other_additional_config():
@@ -318,13 +352,19 @@ def test_ineligible_audio_group_stays_eager_with_a_data_parallel_encoder():
 def test_stage_wrapper_forwards_the_audio_hooks(monkeypatch):
     # The runner builds the manager on the stage wrapper, not on the thinker.
     model, cfg = _combined(monkeypatch, "thinker")
+    # Upstream would give audio [2, 4, 8] from this list's maximum; the derived budgets are [2, 8].
+    cfg.compilation_config.encoder_cudagraph_token_budgets = [3, 16]
     model.thinker.audio_tower = _tower()
     model.thinker._enable_audio_encoder_cudagraph(cfg)
-    for name in ("encoder_cudagraph_group_eligible", "get_encoder_cudagraph_path_max_budget"):
+    for name in (
+        "encoder_cudagraph_group_eligible",
+        "get_encoder_cudagraph_path_max_budget",
+        "get_encoder_cudagraph_path_budgets",
+    ):
         assert getattr_static(model, name).__self__ is model.thinker
     manager = _runner_factory(model, cfg)
     assert manager.supports_modality("audio")
-    assert max(manager.path_token_budgets["audio"]) <= model.thinker.get_encoder_cudagraph_path_max_budget("audio")
+    assert manager.path_token_budgets["audio"] == [0, 2, 8]
     assert manager.execute(_audio([5, 9])) is None
 
 

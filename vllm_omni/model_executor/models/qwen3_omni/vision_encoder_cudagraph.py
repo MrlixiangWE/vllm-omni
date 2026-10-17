@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3_omni_moe_thinker import _get_feat_extract_output_lengths
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -23,6 +24,9 @@ _FLASH_BACKENDS = {
     AttentionBackendEnum.ROCM_AITER_FA,
     AttentionBackendEnum.TRITON_ATTN,
 }
+# Audio graphs are validated on CUDA with these two backends only.
+_AUDIO_BACKENDS = {AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TRITON_ATTN}
+logger = init_logger(__name__)
 # Images keep the path name they were captured under before audio existed.
 _IMAGE_PATH = "default"
 _AUDIO_PATH = "audio"
@@ -31,9 +35,15 @@ _AUDIO_PATH = "audio"
 def _audio_graphs_requested(vllm_config) -> bool:
     """False when the stage's additional_config sets ``audio_encoder_cudagraph: false``."""
     additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, Mapping):
+    value = additional.get("audio_encoder_cudagraph", True) if isinstance(additional, Mapping) else True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
         return True
-    return str(additional.get("audio_encoder_cudagraph", True)).strip().lower() not in {"0", "false", "no", "off"}
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"additional_config.audio_encoder_cudagraph must be true or false, got {value!r}")
 
 
 def _pad_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -85,18 +95,25 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # largest budget must hold at least one audio chunk. The stage's
         # additional_config can turn audio graphs off while images still replay.
         audio_tower = getattr(self, "audio_tower", None)
-        if (
-            _audio_graphs_requested(vllm_config)
-            and not getattr(vllm_config, "use_v2_model_runner", False)
-            and not self.multimodal_config.enable_mm_embeds
-            and self.multimodal_config.mm_encoder_attn_dtype is None
-            and self.multimodal_config.get_limit_per_prompt("audio") > 0
-            and self.multimodal_config.mm_encoder_tp_mode != "data"
-            and getattr(audio_tower, "attn_backend", None) in _FLASH_BACKENDS
-            and self._max_encoder_cudagraph_budget(vllm_config) >= self._audio_tokens_per_chunk()
-            and get_pp_group().is_first_rank
-        ):
-            self._add_encoder_cudagraph_modality("audio")
+        mm = self.multimodal_config
+        if mm.enable_mm_embeds or mm.mm_encoder_attn_dtype is not None or mm.get_limit_per_prompt("audio") <= 0:
+            return
+        reason = None
+        if not _audio_graphs_requested(vllm_config):
+            reason = "additional_config sets audio_encoder_cudagraph to false"
+        elif getattr(vllm_config, "use_v2_model_runner", False):
+            reason = "model runner v2 is in use"
+        elif mm.mm_encoder_tp_mode == "data":
+            reason = "the multimodal encoder runs data parallel"
+        elif getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
+            reason = f"the audio attention backend is {getattr(audio_tower, 'attn_backend', None)}"
+        elif self._max_encoder_cudagraph_budget(vllm_config) < self._audio_tokens_per_chunk():
+            reason = f"no encoder graph budget holds one {self._audio_tokens_per_chunk()}-token audio chunk"
+        if reason is None:
+            if get_pp_group().is_first_rank:
+                self._add_encoder_cudagraph_modality("audio")
+        elif getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
+            logger.info("Audio encoder CUDA graphs stay off: %s.", reason)
 
     def _max_encoder_cudagraph_budget(self, vllm_config) -> int:
         budgets = vllm_config.compilation_config.encoder_cudagraph_token_budgets
@@ -301,6 +318,8 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
             tower = self.audio_tower
             metadata = tower.prepare_encoder_metadata(self._audio_lengths(mm_kwargs))
             features = mm_kwargs["input_audio_features"].to(tower.dtype)
+            if max(metadata["chunk_lengths"], default=0) != tower.n_window * 2:
+                raise ValueError("audio graph replay needs a full-length chunk; check encoder_cudagraph_group_eligible")
             return EncoderCudaGraphReplayBuffers(
                 values={
                     # encoder_cudagraph_group_eligible guarantees a full-length

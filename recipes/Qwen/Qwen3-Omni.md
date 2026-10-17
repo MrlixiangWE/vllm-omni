@@ -88,9 +88,14 @@ shorter than one second. Set `encoder_cudagraph_token_budgets`
 and `encoder_cudagraph_max_vision_items_per_batch` in the same
 `compilation_config` to change them (for audio, each listed budget rounds down
 to whole 13-token chunks and stops at 104 tokens); each captured budget adds
-graph memory on the thinker's GPU. To keep the image graphs and run audio
-eagerly, set `audio_encoder_cudagraph: false` in the thinker stage's
-`additional_config`.
+graph memory on the thinker's GPU. Audio stays eager with model runner v2,
+with `mm_encoder_tp_mode: data`, and when no listed budget reaches 13 tokens;
+to keep the image graphs and run audio eagerly in other setups, start with
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}, "additional_config": {"audio_encoder_cudagraph": false}}}'
+```
 
 ### Stage-based launch (one stage per process)
 
