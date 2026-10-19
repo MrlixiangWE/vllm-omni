@@ -94,7 +94,8 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         # encoder runs data parallel (the audio tower itself stays tensor
         # parallel there) and under model runner v2, which builds the upstream
         # manager and never consults encoder_cudagraph_group_eligible; and the
-        # largest budget must hold at least one audio chunk. The stage's
+        # largest budget must hold at least one audio chunk. Audio graphs are
+        # CUDA only, so ROCm, NPU and XPU take the same eager path. The stage's
         # additional_config can turn audio graphs off while images still replay.
         audio_tower = getattr(self, "audio_tower", None)
         mm = self.multimodal_config
@@ -108,7 +109,9 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"
         elif not current_omni_platform.is_cuda():
-            reason = "audio encoder graphs are validated on CUDA only"
+            reason = (
+                f"audio encoder graphs are validated on CUDA only, this platform is {current_omni_platform.device_name}"
+            )
         elif getattr(audio_tower, "attn_backend", None) not in _AUDIO_BACKENDS:
             reason = f"the audio attention backend is {getattr(audio_tower, 'attn_backend', None)}"
         elif self._max_encoder_cudagraph_budget(vllm_config) < self._audio_tokens_per_chunk():

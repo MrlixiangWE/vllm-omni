@@ -41,7 +41,7 @@ N_WINDOW, N_WINDOW_INFER, MEL = 8, 64, 8
 def _first_pipeline_rank(monkeypatch):
     monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
     # Audio graphs are CUDA only; these CPU tests stand in for a CUDA platform unless a case changes it.
-    monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(graph_module, "current_omni_platform", _platform("cuda"))
     # The tiny tower uses its own chunk size; production lengths assume 100-frame chunks.
     monkeypatch.setattr(
         graph_module,
@@ -169,6 +169,10 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
     return thinker
 
 
+def _platform(name):
+    return SimpleNamespace(is_cuda=lambda: name == "cuda", device_name=name)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -184,6 +188,8 @@ def _audio_thinker(budgets=(2, 4, 8), max_items=2, **mm_changes):
         "opted_out_as_string",
         "rocm_aiter_backend",
         "rocm_platform",
+        "npu_platform",
+        "xpu_platform",
         None,
     ],
 )
@@ -214,9 +220,9 @@ def test_audio_graph_gate(monkeypatch, change):
         cfg.additional_config = {"audio_encoder_cudagraph": "false"}
     elif change == "rocm_aiter_backend":
         thinker.audio_tower.attn_backend = AttentionBackendEnum.ROCM_AITER_FA
-    elif change == "rocm_platform":
+    elif change in ("rocm_platform", "npu_platform", "xpu_platform"):
         # ROCm returns FLASH_ATTN on CDNA without AITER and on RDNA, so the backend alone does not exclude it.
-        monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: False))
+        monkeypatch.setattr(graph_module, "current_omni_platform", _platform(change.removesuffix("_platform")))
     thinker._enable_audio_encoder_cudagraph(cfg)
     assert ("audio" in thinker.get_encoder_cudagraph_config().modalities) is (change is None)
     # The image path stays enabled either way.
@@ -237,7 +243,10 @@ def test_unrecognised_audio_graph_setting_is_rejected():
     [
         (True, "data_parallel", "the multimodal encoder runs data parallel"),
         (False, "data_parallel", None),
-        (True, "rocm", "audio encoder graphs are validated on CUDA only"),
+        (True, "rocm", "audio encoder graphs are validated on CUDA only, this platform is rocm"),
+        (True, "npu", "audio encoder graphs are validated on CUDA only, this platform is npu"),
+        (True, "xpu", "audio encoder graphs are validated on CUDA only, this platform is xpu"),
+        (False, "npu", None),
     ],
 )
 def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch, graphs_on, case, reason):
@@ -248,7 +257,7 @@ def test_audio_graphs_left_off_are_logged_when_encoder_graphs_are_on(monkeypatch
     if case == "data_parallel":
         thinker.multimodal_config.mm_encoder_tp_mode = "data"
     else:
-        monkeypatch.setattr(graph_module, "current_omni_platform", SimpleNamespace(is_cuda=lambda: False))
+        monkeypatch.setattr(graph_module, "current_omni_platform", _platform(case))
     logged = []
     monkeypatch.setattr(graph_module.logger, "info", lambda msg, *args: logged.append(msg % args))
     thinker._enable_audio_encoder_cudagraph(cfg)
