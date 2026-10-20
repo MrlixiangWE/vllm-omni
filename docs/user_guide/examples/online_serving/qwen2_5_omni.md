@@ -36,6 +36,13 @@ eager encoder in one call (default model runner). Set `encoder_cudagraph_token_b
 `encoder_cudagraph_max_vision_items_per_batch` in the same `compilation_config`
 to change them; each captured budget adds graph memory on the thinker's GPU.
 
+Omni keeps soundfile as the first automatic audio decoder to preserve input
+waveforms when upgrading to vLLM 0.32. Switching decoders can change BF16 audio
+features and mixed-media answers. Formats unsupported by soundfile continue
+through upstream's torchcodec/PyAV fallback. To explicitly select a decoder,
+use `--media-io-kwargs '{"audio":{"audio_backend":"torchcodec"}}'` (or
+`soundfile` / `pyav`); explicit selections retain upstream behavior.
+
 ### Send Multi-modal Request
 
 Get into the example folder
