@@ -369,8 +369,11 @@ def test_a_group_one_graph_holds_replays_once(inputs):
         for meta in graphs.values():
             meta.graph = SimpleNamespace(replay=counted(meta.graph.replay))
     group = _audio(sizes) if kind == "audio" else _images(sizes)
+    selected = model.select_encoder_cudagraph_items
+    model.select_encoder_cudagraph_items = lambda kwargs, indices: pytest.fail("whole group re-selected")
     with torch.no_grad():
         outputs = manager.execute(group)
+        model.select_encoder_cudagraph_items = selected
         expected = model.encoder_eager_forward(group)
     assert outputs is not None and len(outputs) == len(sizes)
     assert len(replays) == 1

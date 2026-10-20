@@ -78,7 +78,12 @@ class SingleReplayEncoderCudaGraphManager(EncoderCudaGraphManager):
         if not specs:
             return []
         indices = list(range(len(specs)))
-        batch_mm_kwargs, axis_keys = self._select_items(mm_kwargs, indices)
+        # Without capture axes the whole group in its original order already is
+        # the selected batch, so skip slicing and re-concatenating every item.
+        if self._capture_axes:
+            batch_mm_kwargs, axis_keys = self._select_items(mm_kwargs, indices)
+        else:
+            batch_mm_kwargs, axis_keys = mm_kwargs, ()
         outputs: dict[str, torch.Tensor] = {}
         for path, budgets in self.path_token_budgets.items():
             tokens = sum(spec.get_path_output_tokens(path) for spec in specs)
