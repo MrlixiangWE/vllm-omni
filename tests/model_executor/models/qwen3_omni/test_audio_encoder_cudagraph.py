@@ -339,6 +339,44 @@ def test_audio_replay_matches_eager_and_keeps_earlier_outputs(lengths):
         torch.testing.assert_close(output, reference)
 
 
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        ("audio", [17, 5]),
+        ("audio", [40, 9]),
+        ("audio", [9, 33]),
+        ("image", [[1, 2, 4], [1, 2, 2]]),
+        ("audio", [5, 17]),
+        ("image", [[1, 2, 4], [1, 2, 6]]),
+    ],
+)
+def test_a_group_one_graph_holds_replays_once(inputs):
+    # vLLM 0.32's packing splits [17, 5], [5, 17] and the 2+3-token images across
+    # replays; the other groups also replay once on vLLM 0.31.
+    kind, sizes = inputs
+    model = _audio_thinker()
+    manager = _cpu_manager(model)
+    replays = []
+
+    def counted(inner):
+        def replay():
+            replays.append(1)
+            inner()
+
+        return replay
+
+    for graphs in manager.budget_graphs.values():
+        for meta in graphs.values():
+            meta.graph = SimpleNamespace(replay=counted(meta.graph.replay))
+    group = _audio(sizes) if kind == "audio" else _images(sizes)
+    with torch.no_grad():
+        outputs = manager.execute(group)
+        expected = model.encoder_eager_forward(group)
+    assert outputs is not None and len(outputs) == len(sizes)
+    assert len(replays) == 1
+    torch.testing.assert_close(torch.cat(outputs), expected)
+
+
 def test_images_still_replay_with_audio_enabled():
     model = _audio_thinker()
     manager = _cpu_manager(model)
