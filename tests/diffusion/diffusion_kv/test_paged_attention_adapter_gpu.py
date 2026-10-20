@@ -15,7 +15,7 @@ from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
@@ -27,7 +27,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.vllm_config import _DiffusionVllmModelConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 _LAYER_NAME = "model.layers.0.attn"
 _NUM_HEADS = 2
@@ -123,7 +123,6 @@ def _native_adapter(num_rows: int = 1, cache_role: str = "primary", resolve_row=
             max_num_batched_tokens=32 * num_rows,
             max_num_blocks_per_group=[2],
             device=device,
-            kernel_block_sizes=kernel_block_sizes,
         )
 
     for row in range(num_rows):
@@ -147,7 +146,6 @@ def _native_adapter(num_rows: int = 1, cache_role: str = "primary", resolve_row=
     return adapter, diffusion_layer, device
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     ("sequence_id", "context_id", "cache_role"),
     [
