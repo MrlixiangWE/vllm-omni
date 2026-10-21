@@ -488,6 +488,34 @@ class TestResumablePrepare:
         assert runner.state_cache == {}
         assert runner.input_batch is None
 
+    def test_the_memory_profile_rejects_a_request_that_never_denoises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runner = _make_runner(_StepPipeline(num_steps=1))
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
+        # A previous profile's batch must not count for this one.
+        runner.profile_run(
+            [
+                OmniDiffusionRequest(
+                    prompt="a prompt",
+                    request_id="profile-0",
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                )
+            ]
+        )
+
+        runner.pipeline = _TextOnlyPipeline(prepare_steps=2)
+        request = OmniDiffusionRequest(
+            prompt="a prompt",
+            request_id="profile-1",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        )
+        with pytest.raises(RuntimeError, match="did not reach a denoise step"):
+            runner.profile_run([request])
+        assert runner.state_cache == {}
+
     def test_atomic_prepare_still_denoises_on_the_first_invocation(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -203,6 +203,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        # Set whenever a denoise InputBatch is built. Completion releases the
+        # batch right away, so memory profiling reads this latch instead.
+        self._denoise_batch_built = False
         self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
@@ -1030,6 +1033,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         runner_output: BatchRunnerOutput | None = None
         request_ids = [request.request_id for request in requests]
+        self._denoise_batch_built = False
         try:
             if getattr(self.od_config, "step_execution", False):
                 scheduler_output = DiffusionSchedulerOutput(
@@ -1052,7 +1056,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # the denoise allocations this profile is sizing would never
                 # happen. Keep going until a denoise step has actually run.
                 waves = 0
-                while self.input_batch is None and self.state_cache and waves < self._MAX_PROFILE_PREPARE_WAVES:
+                while not self._denoise_batch_built and self.state_cache and waves < self._MAX_PROFILE_PREPARE_WAVES:
                     waves += 1
                     runner_output = self._execute_stepwise(
                         DiffusionSchedulerOutput(
@@ -1067,10 +1071,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         record_output_peak_memory=False,
                         in_diffusion_kv_memory_profile=True,
                     )
-                # An emptied state_cache means the profile request finished
-                # inside its prepare phase and never sized a denoise batch,
-                # which is as useless for this profile as running out of waves.
-                if self.input_batch is None:
+                # A completed denoise step releases its batch at once, so the
+                # verdict reads the build latch. An emptied state_cache without
+                # it means the profile request finished inside its prepare
+                # phase and never sized a denoise batch, which is as useless
+                # for this profile as running out of waves.
+                if not self._denoise_batch_built:
                     raise RuntimeError(
                         "Diffusion memory profiling did not reach a denoise step after "
                         f"{waves} prepare waves; the profile would understate the budget."
@@ -1322,6 +1328,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             cached_batch=getattr(self, "input_batch", None),
         )
         self.input_batch = input_batch
+        self._denoise_batch_built = True
         return prepared_states, input_batch, pending_outputs
 
     def _fail_stepwise_request(
