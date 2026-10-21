@@ -410,6 +410,8 @@ class TestPrepareProtocolOnTheRealPipeline:
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": "kv"}, "")
+        plan = SimpleNamespace()
+        pipe._denoise_plan = lambda ns, p, is_it2i: plan
 
         state = _text_state()
         state.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
@@ -419,6 +421,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         assert state.total_steps == 3, "the state carries one entry per denoise interval"
         assert state.latents is schedule.image_prediction
         assert state.extra[pipe._STEP_KEY].caches == {"cond": "kv"}
+        assert state.extra[pipe._STEP_KEY].plan is plan
 
     def test_image_request_with_think_prepares_before_it_denoises(self):
         pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
@@ -433,6 +436,13 @@ class TestPrepareProtocolOnTheRealPipeline:
             return {"cond": "kv"}, "thought"
 
         pipe._t2i_caches = _caches
+        planned_after = []
+
+        def _plan(ns, p, is_it2i):
+            planned_after.append(list(finished_with))
+            return SimpleNamespace()
+
+        pipe._denoise_plan = _plan
 
         state = _text_state()
         state.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
@@ -443,6 +453,8 @@ class TestPrepareProtocolOnTheRealPipeline:
         while pipe.prepare_steps_remaining(state) is not None:
             pipe.prepare_step(state)
         assert finished_with == [cursor]
+        # The per-request denoise plan is built once, after the caches.
+        assert planned_after == [[cursor]]
         assert state.extra[pipe._STEP_KEY].think_text == "thought"
 
 
@@ -548,11 +560,12 @@ class TestThroughTheRunner:
         pipe._extract_input_images = lambda first_prompt: ["image"] if mode == "it2i" else None
         pipe._it2i_prefix = lambda p, ns, images: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._it2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+        pipe._denoise_plan = lambda ns, p, is_it2i: SimpleNamespace()
         v_pred = torch.full((1, 4, 16 * 16 * 3), 2.0)
         seen: list[int] = []
         edit_flags: list[bool] = []
 
-        def _denoise_one(z, ns, caches, p, step_i, is_edit):
+        def _denoise_one(z, ns, plan, caches, p, step_i, is_edit):
             # Production re-patchifies the latents each step and returns the
             # patched tensor alongside the prediction, so the Euler update in
             # `_advance_latents` operates on the patched layout.

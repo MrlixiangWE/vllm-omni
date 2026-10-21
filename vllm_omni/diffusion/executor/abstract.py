@@ -49,7 +49,9 @@ class DiffusionExecutor(ABC):
                 )
             executor_class = distributed_executor_backend
         elif distributed_executor_backend == "ray":
-            raise NotImplementedError("ray backend is not yet supported.")
+            from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
+
+            executor_class = RayDiffusionExecutor
         elif distributed_executor_backend == "mp":
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
@@ -138,8 +140,7 @@ class DiffusionExecutor(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
 
     def drop_output(self, async_output_id: str) -> None:
-        """Reclaim an async output that will never be waited on (e.g. an
-        aborted request).
+        """Reclaim an async output whose consumer is no longer available.
 
         Only executors with an async output path (result pump) cache outputs
         that a consumer must later claim; executors without one have nothing to
@@ -190,16 +191,6 @@ class DiffusionExecutor(ABC):
             "remove_diffusion_kv_requests",
             args=(unique_request_ids,),
         )
-
-    def release_step_requests(self, request_ids: list[str]) -> None:
-        """Retire request-local step state on every Worker at a wave boundary.
-
-        The default control RPC executes on all ranks and aggregates failures.
-        Native KV rows and Scheduler-owned allocations have separate lifetimes.
-        """
-        unique_request_ids = list(dict.fromkeys(request_ids))
-        if unique_request_ids:
-            self.collective_rpc("release_step_requests", args=(unique_request_ids,))
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
         if scheduler_output.kv_prefetch_connector_metadata is not None:

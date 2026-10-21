@@ -6,12 +6,11 @@ from __future__ import annotations
 
 import contextlib
 import gc
-import queue
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -42,7 +41,6 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerWrapperBase
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -271,24 +269,26 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
     engine._init_runtime_state()
     engine._init_execute_fn()
     engine.stop_event = threading.Event()
-    outputs: queue.Queue[tuple[str, DiffusionOutput]] = queue.Queue()
-    engine._put_output = lambda request_id, output: outputs.put((request_id, output))
+    engine.main_loop = None
     request = _new_output("abort-last").scheduled_new_reqs[0].req
-    engine.scheduler.add_request(request)
+    request_id = engine._add_prepared_request(request)
+    stream = engine._out_streams[request_id]
     thread = threading.Thread(target=engine._busy_loop)
     thread.start()
     try:
         assert entered.wait(10), "request did not reach its active wave"
-        engine.abort([request.request_id, request.request_id])
+        engine.abort([request_id, request_id])
         # Public abort enqueues control work. It cannot destroy a state that
         # the worker is still using inside prepare or denoise.
-        assert request.request_id in runner.state_cache
-        assert request.request_id in worker._step_lora_state
+        assert request_id in runner.state_cache
+        assert request_id in worker._step_lora_state
         if phase == "denoise":
             assert runner.input_batch is not None
         resume.set()
-        request_id, output = outputs.get(timeout=10)
-        assert request_id == request.request_id
+        deadline = time.monotonic() + 10
+        while stream.empty() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        output = stream.get_nowait()
         assert output.aborted
         assert not engine.scheduler.has_requests()
         assert runner.state_cache == {}
@@ -308,34 +308,6 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
         assert not thread.is_alive()
 
 
-def test_step_release_preserves_live_requests_and_native_kv_ownership():
-    runner = _make_runner(_StepPipeline())
-    ended, live = object(), object()
-    runner.state_cache = {"ended": ended, "live": live}
-    runner.input_batch = SimpleNamespace(request_ids=["ended", "live"], states=[ended, live])
-    runner.diffusion_kv_backend = SimpleNamespace(remove_diffusion_kv_requests=Mock())
-    worker = object.__new__(DiffusionWorker)
-    worker.model_runner = runner
-    worker._step_lora_state = {"ended": (None, 1.0), "live": (None, 0.5)}
-
-    assert worker.release_step_requests(["ended", "missing", "ended"]) == 1
-    assert runner.state_cache == {"live": live}
-    assert worker._step_lora_state == {"live": (None, 0.5)}
-    assert runner.input_batch is None
-    assert worker.release_step_requests(["ended", "missing"]) == 0
-    runner.diffusion_kv_backend.remove_diffusion_kv_requests.assert_not_called()
-
-
-def test_step_release_uses_the_all_rank_control_rpc_and_propagates_errors():
-    executor = object.__new__(UniProcDiffusionExecutor)
-    executor.collective_rpc = Mock(side_effect=RuntimeError("nonzero rank cleanup failed"))
-    with pytest.raises(RuntimeError, match="nonzero rank cleanup failed"):
-        executor.release_step_requests(["ended", "ended"])
-    # Omitting unique_reply_rank uses the shared control protocol that executes
-    # on every rank and gathers their statuses, including nonzero-rank errors.
-    executor.collective_rpc.assert_called_once_with("release_step_requests", args=(["ended"],))
-
-
 def test_worker_releases_a_normal_terminal_request_without_another_wave():
     runner = _make_runner(_ResumablePipeline(prepare_steps=0, num_steps=1))
     runner.vllm_config = VllmConfig()
@@ -348,45 +320,6 @@ def test_worker_releases_a_normal_terminal_request_without_another_wave():
     assert runner.state_cache == {}
     assert runner.input_batch is None
     assert worker._step_lora_state == {}
-
-
-@pytest.mark.parametrize("failure", ["lora", "profiler_enter", "profiler_exit", "profiler_step"])
-def test_worker_retires_only_the_failed_wave_even_before_runner_execution(failure):
-    runner = _make_runner(_StepPipeline())
-    failed, live = object(), object()
-    runner.state_cache = {"failed": failed, "live": live}
-    runner.input_batch = SimpleNamespace(request_ids=["failed", "live"], states=[failed, live])
-    runner.diffusion_kv_backend = SimpleNamespace(remove_diffusion_kv_requests=Mock())
-    runner.execute_stepwise = Mock(
-        return_value=BatchRunnerOutput.from_list([RunnerOutput(request_id="failed", finished=False)])
-    )
-    worker = object.__new__(DiffusionWorker)
-    worker.model_runner = runner
-    worker._step_lora_state = {"failed": (object(), 1.0), "live": (None, 0.5)}
-    error = RuntimeError(f"injected {failure} failure")
-    worker.lora_manager = SimpleNamespace(set_active_adapter=Mock(side_effect=error if failure == "lora" else None))
-
-    @contextmanager
-    def profiler_context():
-        if failure == "profiler_enter":
-            raise error
-        yield
-        if failure == "profiler_exit":
-            raise error
-
-    worker.profiler = SimpleNamespace(
-        annotate_context_manager=lambda _name: profiler_context(),
-        step=Mock(side_effect=error if failure == "profiler_step" else None),
-    )
-    with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
-        worker.execute_stepwise(_cached_output("failed"))
-
-    assert runner.state_cache == {"live": live}
-    assert worker._step_lora_state == {"live": (None, 0.5)}
-    assert runner.input_batch is None
-    runner.diffusion_kv_backend.remove_diffusion_kv_requests.assert_not_called()
-    if failure in {"lora", "profiler_enter"}:
-        runner.execute_stepwise.assert_not_called()
 
 
 class TestCapability:

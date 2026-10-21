@@ -239,8 +239,8 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, input_batch, **kwargs):
-        del input_batch, kwargs
+    def denoise_step(self, state, **kwargs):
+        del state, kwargs
         self.denoise_calls += 1
         return None
 
@@ -414,7 +414,6 @@ def _make_runner(
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -435,7 +434,6 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -555,6 +553,102 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("buffer_seconds", [None, 1.25])
+def test_chunk_boundary_defers_only_when_playback_feedback_is_enabled(monkeypatch, mocker, buffer_seconds):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    pending: list[str] = []
+    applied: list[str] = []
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            applied.extend(pending)
+            pending.clear()
+
+        def prepare_next_chunk(self, state):
+            state.latents = torch.tensor([float(len(applied))])
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = buffer_seconds
+    first_wave = _make_scheduler_output(request)
+    if buffer_seconds is not None:
+        from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
+
+        first_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(boundary_at=0.0)
+    runner.execute_stepwise(first_wave)
+    output = runner.execute_stepwise(_make_cached_scheduler_output()).get_request_output("req-1")
+    assert output.result is not None and not output.finished
+    if buffer_seconds is not None:
+        assert output.streaming_next_media_duration == 1.0
+
+    # The transport/RPC loop can receive a key only after execute returns.
+    pending.append("key-release")
+    next_wave = _make_cached_scheduler_output(step_id=2)
+    if buffer_seconds is not None:
+        next_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(
+            boundary_at=1.0, window_opened_at=0.0, window_end_at=1.0
+        )
+    runner.execute_stepwise(next_wave)
+    assert applied == (["key-release"] if buffer_seconds is not None else [])
+    assert runner.input_batch.latents.item() == (1.0 if buffer_seconds is not None else 0.0)
+    if buffer_seconds is not None:
+        assert runner.input_batch.states[0].interaction_boundary == next_wave.interaction_boundaries["req-1"]
+
+
+@pytest.mark.cpu
+def test_playback_window_rejects_oversized_first_chunk_before_denoising(monkeypatch, mocker):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            pass
+
+        def prepare_next_chunk(self, state):
+            pass
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    forward = mocker.spy(runner.pipeline, "denoise_step")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = 0.75
+    output = runner.execute_stepwise(_make_scheduler_output(request)).get_request_output("req-1")
+    assert output.finished
+    assert "must fit a complete media chunk" in output.result.error
+    forward.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_cleanup_wave_releases_last_state_and_batch_without_forward(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    runner.execute_stepwise(_make_scheduler_output(_make_step_request()))
+    assert runner.state_cache and runner.input_batch is not None
+    cleanup = _make_cached_scheduler_output(finished_req_ids={"req-1"})
+    cleanup.scheduled_cached_reqs = CachedRequestData.make_empty()
+    output = runner.execute_stepwise(cleanup)
+    assert output.runner_outputs == []
+    assert not runner.state_cache
+    assert runner.input_batch is None
+    assert runner.pipeline.denoise_calls == 1
+
+
+@pytest.mark.cpu
 def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
     first_state = _make_input_batch_state("req-1", 1.0)
     batch = InputBatch.make_batch([first_state])
@@ -654,8 +748,7 @@ class TestRunner:
     ):
         runner = _make_runner(diffusion_kv_mode)
         cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
-        expected_output = BatchRunnerOutput(runner_outputs=[])
-        mocker.patch.object(runner, "_execute_stepwise_core", return_value=expected_output)
+        execute = mocker.patch.object(runner, "_execute_stepwise_core")
         scheduler_output = DiffusionSchedulerOutput(
             step_id=1,
             scheduled_new_reqs=[],
@@ -667,7 +760,8 @@ class TestRunner:
 
         output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
-        assert output is expected_output
+        assert output.runner_outputs == []
+        execute.assert_not_called()
         if should_cleanup:
             cleanup.assert_called_once_with(["finished-request"])
         else:
@@ -736,6 +830,7 @@ class TestRunner:
         assert second.result.error is None
         assert torch.equal(second.result.output, torch.tensor([2.0]))
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
@@ -1099,8 +1194,6 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
-            device: torch.device
-
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1209,7 +1302,7 @@ class _RecordingLoRAManager:
     def __init__(self) -> None:
         self.calls: list[tuple[object | None, float]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+    def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
 
@@ -1219,10 +1312,7 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
-    worker.model_runner = SimpleNamespace(
-        execute_stepwise=lambda arg: output,
-        release_step_requests=lambda request_ids: 0,
-    )
+    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
     return worker
 
 
@@ -1330,6 +1420,36 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+
+    @pytest.mark.parametrize("error", [None, "decode failed"])
+    def test_terminal_output_retires_lora_state_without_another_wave(self, error):
+        terminal = RunnerOutput("done", finished=True, result=DiffusionOutput(error=error))
+        # A decoded chunk is not necessarily the final output of its request.
+        chunk = RunnerOutput("streaming", finished=False, result=DiffusionOutput(output=torch.ones(1)))
+        expected = BatchRunnerOutput.from_list([terminal, chunk])
+        worker = _make_step_worker(expected_output=expected)
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("done", "streaming")])
+
+        output = worker.execute_stepwise(scheduled)
+
+        assert output is expected
+        assert worker._step_lora_state == {"streaming": (None, 1.0)}
+        assert torch.equal(chunk.result.output, torch.ones(1))
+
+    def test_runner_exception_retires_only_scheduled_lora_state(self):
+        worker = _make_step_worker()
+        worker._step_lora_state["unscheduled"] = (None, 0.5)
+
+        def fail(_):
+            raise RuntimeError("denoise failed")
+
+        worker.model_runner.execute_stepwise = fail
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("first", "second")])
+
+        with pytest.raises(RuntimeError, match="denoise failed"):
+            worker.execute_stepwise(scheduled)
+
+        assert worker._step_lora_state == {"unscheduled": (None, 0.5)}
 
 
 @pytest.mark.cpu
