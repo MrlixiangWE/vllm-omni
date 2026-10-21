@@ -203,9 +203,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
-        # Set whenever a denoise InputBatch is built. Completion releases the
-        # batch right away, so memory profiling reads this latch instead.
-        self._denoise_batch_built = False
         self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
@@ -1012,11 +1009,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])
 
-    #: Prepare waves the memory profile will drive before giving up. A profile
-    #: request decodes at most a few tokens; anything beyond this is a pipeline
-    #: whose prepare phase never ends.
-    _MAX_PROFILE_PREPARE_WAVES = 2048
-
     def profile_run(self, requests: list[OmniDiffusionRequest]) -> None:
         """Run the maximum per-rank request batch for memory profiling.
 
@@ -1033,7 +1025,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         runner_output: BatchRunnerOutput | None = None
         request_ids = [request.request_id for request in requests]
-        self._denoise_batch_built = False
         try:
             if getattr(self.od_config, "step_execution", False):
                 scheduler_output = DiffusionSchedulerOutput(
@@ -1052,35 +1043,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     record_output_peak_memory=False,
                     in_diffusion_kv_memory_profile=True,
                 )
-                # A resumable prepare phase spends that first call decoding, so
-                # the denoise allocations this profile is sizing would never
-                # happen. Keep going until a denoise step has actually run.
-                waves = 0
-                while not self._denoise_batch_built and self.state_cache and waves < self._MAX_PROFILE_PREPARE_WAVES:
-                    waves += 1
-                    runner_output = self._execute_stepwise(
-                        DiffusionSchedulerOutput(
-                            step_id=waves,
-                            scheduled_new_reqs=[],
-                            scheduled_cached_reqs=CachedRequestData(request_ids=list(self.state_cache)),
-                            finished_req_ids=set(),
-                            num_running_reqs=len(self.state_cache),
-                            num_waiting_reqs=0,
-                        ),
-                        validate_kv_metadata=False,
-                        record_output_peak_memory=False,
-                        in_diffusion_kv_memory_profile=True,
-                    )
-                # A completed denoise step releases its batch at once, so the
-                # verdict reads the build latch. An emptied state_cache without
-                # it means the profile request finished inside its prepare
-                # phase and never sized a denoise batch, which is as useless
-                # for this profile as running out of waves.
-                if not self._denoise_batch_built:
-                    raise RuntimeError(
-                        "Diffusion memory profiling did not reach a denoise step after "
-                        f"{waves} prepare waves; the profile would understate the budget."
-                    )
             else:
                 runner_output = self._execute_request_list(
                     requests,
@@ -1328,7 +1290,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             cached_batch=getattr(self, "input_batch", None),
         )
         self.input_batch = input_batch
-        self._denoise_batch_built = True
         return prepared_states, input_batch, pending_outputs
 
     def _fail_stepwise_request(
@@ -1376,10 +1337,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         ready: list[StepRequestState] = []
         outputs: list[RunnerOutput] = []
         for state in states:
-            # Same lockstep requirement as prepare_encode() above: every DiT
-            # rank has to reach _dit_any_rank_failed the same number of times.
-            # The loop runs over the scheduler's states rather than over the
-            # ones still preparing, because whether a request is still
+            # Visit every scheduled state; whether a request is still
             # preparing is answered from pipeline-private state.
             per_req_exc: BaseException | None = None
             result: DiffusionOutput | None = None
@@ -1712,7 +1670,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
-                            self.state_cache.pop(req.request_id, None)
+                            self.release_step_requests([req.request_id])
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,

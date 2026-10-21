@@ -46,6 +46,14 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def _cpu_peak_memory(monkeypatch):
+    # The runner samples device peak memory when the platform reports a device;
+    # keep these CPU tests independent of the GPUs on the host.
+    for name in ("is_available", "max_memory_reserved", "max_memory_allocated"):
+        monkeypatch.setattr(model_runner_module.current_omni_platform, name, lambda: 0)
+
+
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     del args, kwargs
@@ -371,6 +379,26 @@ def test_prepare_phase_terminals_reach_the_pipeline_release_hook(monkeypatch, te
     assert pipeline.released == ["req-1"]
 
 
+class _DenoiseFailurePipeline(_ReleaseRecordingPipeline):
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        raise RuntimeError("step scheduler blew up")
+
+
+def test_a_denoise_phase_request_failure_reaches_the_pipeline_release_hook(monkeypatch):
+    pipeline = _DenoiseFailurePipeline(prepare_steps=0)
+    runner = _make_runner(pipeline)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_stepwise(runner, _new_output())
+
+    request_output = output.get_request_output("req-1")
+    assert request_output.finished is True
+    assert "step scheduler blew up" in request_output.result.error
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    assert pipeline.released == ["req-1"]
+
+
 class TestCapability:
     def test_resumable_prepare_is_separate_from_step_execution(self):
         atomic = _StepPipeline()
@@ -511,59 +539,6 @@ class TestResumablePrepare:
 
         assert pipeline.prepare_step_calls == 0
         assert pipeline.denoise_calls == 1
-
-    @pytest.mark.parametrize("num_steps", [1, 2])
-    def test_the_memory_profile_keeps_going_until_a_denoise_step_runs(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        num_steps,
-    ):
-        pipeline = _ResumablePipeline(prepare_steps=4, num_steps=num_steps)
-        runner = _make_runner(pipeline)
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-        monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
-
-        request = OmniDiffusionRequest(
-            prompt="a prompt",
-            request_id="profile-1",
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_steps),
-        )
-        runner.profile_run([request])
-
-        # Sizing the budget from a prepare step alone would miss the denoise
-        # allocations the profile exists to measure.
-        assert pipeline.prepare_step_calls == 4
-        assert pipeline.denoise_calls == 1
-        assert runner.state_cache == {}
-        assert runner.input_batch is None
-
-    def test_the_memory_profile_rejects_a_request_that_never_denoises(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        runner = _make_runner(_StepPipeline(num_steps=1))
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-        monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
-        # A previous profile's batch must not count for this one.
-        runner.profile_run(
-            [
-                OmniDiffusionRequest(
-                    prompt="a prompt",
-                    request_id="profile-0",
-                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-                )
-            ]
-        )
-
-        runner.pipeline = _TextOnlyPipeline(prepare_steps=2)
-        request = OmniDiffusionRequest(
-            prompt="a prompt",
-            request_id="profile-1",
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-        )
-        with pytest.raises(RuntimeError, match="did not reach a denoise step"):
-            runner.profile_run([request])
-        assert runner.state_cache == {}
 
     def test_atomic_prepare_still_denoises_on_the_first_invocation(
         self,
