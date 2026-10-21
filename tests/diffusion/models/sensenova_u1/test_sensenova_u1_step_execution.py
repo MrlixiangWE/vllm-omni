@@ -10,19 +10,29 @@ call or is left and resumed between any two steps.
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import (
     supports_resumable_prepare,
     supports_step_execution,
 )
-from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseNovaU1Pipeline
+from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+    NEOVisionModel,
+    SenseNovaU1Pipeline,
+    TimestepEmbedder,
+    VisionGrid,
+)
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.transformers_utils.configs.sensenova_u1 import SenseNovaU1Config, SenseNovaU1VisionConfig
 
 # CPU tests carry the CPU mark per class; the one CUDA test is a module function.
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -679,6 +689,177 @@ class TestThroughTheRunner:
         assert request_output.finished is True
         assert request_output.result.output["payload"]["text"] == expected
         assert "req-1" not in runner.state_cache
+
+
+# ---------------------------------------------------------------------------
+# Denoise steps on the real ``_denoise``
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DenoiseParams:
+    image_size: tuple[int, int] = (12, 8)
+    batch_size: int = 1
+    num_steps: int = 4
+    cfg_interval: tuple[float, float] = (0.25, 0.75)
+    cfg_scale: float = 4.0
+    img_cfg_scale: float = 2.0
+    seed: int = 42
+    timestep_shift: float = 1.0
+    t_eps: float = 0.02
+    cfg_norm: str | None = None
+
+
+def _small_vision_config():
+    return SenseNovaU1VisionConfig(
+        hidden_size=16, llm_hidden_size=[8], patch_size=2, downsample_ratio=[0.5], max_position_embeddings_vision=64
+    )
+
+
+class _BranchProbe(SenseNovaU1Pipeline):
+    """Real embeddings and the real ``_denoise``; only the transformer forward is recorded.
+
+    Each forward returns a constant velocity, so the latents depend only on the
+    schedule and on which branches ``_denoise`` combines at each step.
+    """
+
+    def __init__(self, noise_embedding: bool):
+        nn.Module.__init__(self)
+        self.device = torch.device("cpu")
+        self.patch_size = 2
+        self.merge_size = 2
+        self.model_cfg = SenseNovaU1Config(add_noise_scale_embedding=noise_embedding)
+        self.od_config = OmniDiffusionConfig(dtype=torch.float32)
+        self.fm_modules = nn.ModuleDict(
+            {
+                "vision_model_mot_gen": NEOVisionModel(_small_vision_config()),
+                "timestep_embedder": TimestepEmbedder(8, 8),
+                "noise_scale_embedder": TimestepEmbedder(8, 8),
+            }
+        )
+        self.steps: list[tuple[bool, list[tuple[str, bool]]]] = []
+        self.noise_embed_calls = 0
+        self.fm_modules["noise_scale_embedder"].register_forward_hook(self._count_noise)
+
+    def _count_noise(self, module, args, output):
+        self.noise_embed_calls += 1
+
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg):
+        self.steps.append((use_cfg, []))
+        return super()._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg)
+
+    def _forward_branch(self, kwargs):
+        self.steps[-1][1].append((kwargs["past_key_values"].name, kwargs.get("cache_dit_skip", False)))
+        return torch.full_like(kwargs["z"], 0.1)
+
+    def predict_noise(self, **kwargs):
+        return self._forward_branch(kwargs)
+
+    def predict_noise_maybe_with_cfg(self, do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, **kwargs):
+        cond = self._forward_branch(positive_kwargs)
+        uncond = self._forward_branch(negative_kwargs)
+        return uncond + true_cfg_scale * (cond - uncond)
+
+    def predict_noise_with_multi_branch_cfg(self, do_true_cfg, true_cfg_scale, branches_kwargs, **kwargs):
+        cond, img_cond, uncond = (self._forward_branch(branch) for branch in branches_kwargs)
+        return uncond + true_cfg_scale["cfg_scale"] * (cond - img_cond) + true_cfg_scale["img_cfg_scale"] * img_cond
+
+
+def _branch_caches() -> dict[str, object]:
+    caches: dict[str, object] = {}
+    for name in ("cond", "uncond", "img_cond"):
+        caches[name] = SimpleNamespace(name=name, layers=[])
+        caches[f"idx_{name}"] = None
+        caches[f"mask_{name}"] = {"full_attention": None}
+    return caches
+
+
+def _expected_branches(t: float, p: _DenoiseParams, is_it2i: bool) -> tuple[bool, list[tuple[str, bool]]]:
+    low, high = p.cfg_interval
+    if not is_it2i:
+        use_cfg = low <= t <= high and p.cfg_scale > 1
+        return use_cfg, ([("cond", False), ("uncond", False)] if use_cfg else [("cond", True)])
+    use_cfg = (low < t < high or low == 0) and (p.cfg_scale != 1 or p.img_cfg_scale != 1)
+    if not use_cfg:
+        return False, [("cond", True)]
+    if p.img_cfg_scale == 1:
+        return True, [("cond", False), ("img_cond", False)]
+    if p.cfg_scale == p.img_cfg_scale:
+        return True, [("cond", False), ("uncond", False)]
+    return True, [("cond", False), ("img_cond", True), ("uncond", False)]
+
+
+def _forbid_host_sync(*args, **kwargs):
+    raise AssertionError("host synchronization inside a denoise step")
+
+
+@pytest.mark.cpu
+class TestDenoiseStepOnTheRealDenoise:
+    """Step mode reads the CFG mask, grid and noise-scale embedding built once per request."""
+
+    @pytest.mark.parametrize(
+        "is_it2i,interval,scale,img_scale",
+        [
+            (False, (0.25, 0.75), 4.0, 1.0),
+            (False, (0.0, 1.0), 1.0, 1.0),
+            (True, (0.25, 0.75), 4.0, 2.0),
+            (True, (0.25, 0.75), 4.0, 1.0),
+            (True, (0.25, 0.75), 3.0, 3.0),
+            (True, (0.0, 0.25), 4.0, 2.0),
+            (True, (0.0, 1.0), 1.0, 1.0),
+        ],
+    )
+    @pytest.mark.parametrize("noise_embedding", [False, True])
+    @torch.inference_mode()
+    def test_step_mode_takes_the_same_cfg_branches_as_request_mode(
+        self, monkeypatch, is_it2i, interval, scale, img_scale, noise_embedding
+    ):
+        torch.manual_seed(0)
+        pipe = _BranchProbe(noise_embedding)
+        p = _DenoiseParams(cfg_interval=interval, cfg_scale=scale, img_cfg_scale=img_scale)
+
+        ns = pipe._init_noise_and_schedule(p)
+        expected = [_expected_branches(float(t), p, is_it2i) for t in ns.timesteps[:-1]]
+        request_image = pipe._run_denoising_loop(ns, _branch_caches(), p, is_it2i=is_it2i).output["payload"]["image"]
+        assert pipe.steps == expected
+        assert pipe.noise_embed_calls == int(noise_embedding)
+
+        pipe.steps.clear()
+        pipe.noise_embed_calls = 0
+        caches = _branch_caches()
+        pipe._t2i_caches = pipe._it2i_caches = lambda p_, ns_, ctx: (caches, "")
+        ns = pipe._init_noise_and_schedule(p)
+        state = StepRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(num_inference_steps=4))
+        state.latents = ns.image_prediction
+        state.timesteps = ns.timesteps[:-1]
+        state.extra[pipe._STEP_KEY] = SimpleNamespace(
+            mode="it2i" if is_it2i else "t2i",
+            p=p,
+            ns=ns,
+            prefix=None,
+            caches=None,
+            plan=None,
+            think_text="",
+            output=None,
+            z=None,
+            cursor=None,
+        )
+        pipe._finish_prepare(state)
+        assert pipe.noise_embed_calls == int(noise_embedding)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "item", _forbid_host_sync)
+            patch.setattr(torch.Tensor, "tolist", _forbid_host_sync)
+            patch.setattr(torch.Tensor, "__bool__", _forbid_host_sync)
+            patch.setattr(VisionGrid, "from_tensor", classmethod(_forbid_host_sync))
+            while state.step_index < state.total_steps:
+                prediction = pipe.denoise_step(SimpleNamespace(states=[state]), states=[state])
+                pipe.step_scheduler(state, prediction)
+
+        assert pipe.steps == expected
+        assert pipe.noise_embed_calls == int(noise_embedding)
+        step_image = pipe.post_decode(state).output["payload"]["image"]
+        assert np.array_equal(np.asarray(step_image), np.asarray(request_image))
 
 
 @pytest.mark.cpu
