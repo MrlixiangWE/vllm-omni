@@ -12,6 +12,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -427,7 +428,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": "kv"}, "")
-        plan = SimpleNamespace()
+        plan = SimpleNamespace(cfg_steps=[True, False, False])
         pipe._denoise_plan = lambda ns, p, is_it2i: plan
 
         state = _text_state()
@@ -439,6 +440,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         assert state.latents is schedule.image_prediction
         assert state.extra[pipe._STEP_KEY].caches == {"cond": "kv"}
         assert state.extra[pipe._STEP_KEY].plan is plan
+        assert state.do_true_cfg is True
 
     def test_image_request_with_think_prepares_before_it_denoises(self):
         pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
@@ -457,7 +459,7 @@ class TestPrepareProtocolOnTheRealPipeline:
 
         def _plan(ns, p, is_it2i):
             planned_after.append(list(finished_with))
-            return SimpleNamespace()
+            return SimpleNamespace(cfg_steps=[])
 
         pipe._denoise_plan = _plan
 
@@ -579,7 +581,7 @@ class TestThroughTheRunner:
         pipe._extract_input_images = lambda first_prompt: ["image"] if mode == "it2i" else None
         pipe._it2i_prefix = lambda p, ns, images: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._it2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
-        pipe._denoise_plan = lambda ns, p, is_it2i: SimpleNamespace()
+        pipe._denoise_plan = lambda ns, p, is_it2i: SimpleNamespace(cfg_steps=[])
         v_pred = torch.full((1, 4, 16 * 16 * 3), 2.0)
         seen: list[int] = []
         edit_flags: list[bool] = []
@@ -627,8 +629,7 @@ class TestThroughTheRunner:
             output = DiffusionModelRunner.execute_stepwise(runner, cached)
             request_output = output.get_request_output("req-img")
 
-        # One denoise per interval, in order, and the latents carry the Euler
-        # update for each of them: sum((t_next - t) * 2.0) over the schedule.
+        # One denoise per interval, in order.
         assert seen == [0, 1, 2]
         assert edit_flags == [mode == "it2i"] * 3
         assert request_output.finished is True
@@ -805,6 +806,7 @@ class TestDenoiseStepOnTheRealDenoise:
             (True, (0.25, 0.75), 4.0, 2.0),
             (True, (0.25, 0.75), 4.0, 1.0),
             (True, (0.25, 0.75), 3.0, 3.0),
+            (True, (0.25, 0.75), 1.0, 2.0),
             (True, (0.0, 0.25), 4.0, 2.0),
             (True, (0.0, 1.0), 1.0, 1.0),
         ],
@@ -846,6 +848,7 @@ class TestDenoiseStepOnTheRealDenoise:
         )
         pipe._finish_prepare(state)
         assert pipe.noise_embed_calls == int(noise_embedding)
+        assert state.do_true_cfg is any(use_cfg for use_cfg, _ in expected)
 
         with monkeypatch.context() as patch:
             patch.setattr(torch.Tensor, "item", _forbid_host_sync)
@@ -897,3 +900,40 @@ class TestReleaseStepRequest:
         pipe.release_step_request(state)
 
         assert state.extra == {}
+
+
+@pytest.mark.cpu
+def test_pipeline_profiles_the_resumable_denoise_entry_points(monkeypatch):
+    import vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 as pipeline_module
+
+    model_config = SimpleNamespace(
+        llm_config=SimpleNamespace(hidden_size=8),
+        vision_config=SimpleNamespace(patch_size=2),
+        downsample_ratio=0.5,
+        use_pixel_head=True,
+        add_noise_scale_embedding=False,
+    )
+    language_model = nn.Module()
+    language_model.model = nn.Module()
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(pipeline_module, "_resolve_model_path", lambda path: path)
+    monkeypatch.setattr(pipeline_module.SenseNovaU1Config, "from_pretrained", lambda *a, **k: model_config)
+    monkeypatch.setattr(pipeline_module.AutoTokenizer, "from_pretrained", Mock(return_value=Mock()))
+    monkeypatch.setattr(pipeline_module, "SenseNovaU1ForCausalLM", lambda *a, **k: language_model)
+    monkeypatch.setattr(pipeline_module, "NEOVisionModel", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(pipeline_module, "ConvDecoder", lambda hidden_size: nn.Identity())
+    monkeypatch.setattr(SenseNovaU1Pipeline, "_denoise_one", lambda self: "request")
+    monkeypatch.setattr(SenseNovaU1Pipeline, "denoise_step", lambda self: "step")
+    od_config = SimpleNamespace(
+        model="sensenova-test-model",
+        dtype=torch.bfloat16,
+        quantization_config=None,
+        revision=None,
+        enable_diffusion_pipeline_profiler=True,
+    )
+    pipeline = SenseNovaU1Pipeline(od_config=od_config)
+
+    assert pipeline._denoise_one() == "request"
+    assert pipeline.denoise_step() == "step"
+    assert pipeline.stage_durations["SenseNovaU1Pipeline._denoise_one"] >= 0
+    assert pipeline.stage_durations["SenseNovaU1Pipeline.diffuse"] >= 0

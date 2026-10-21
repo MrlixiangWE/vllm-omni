@@ -1865,7 +1865,6 @@ class SenseNovaU1Pipeline(
             state.latents = ns.image_prediction
             state.timesteps = ns.timesteps[:-1]
             state.step_index = 0
-            state.do_true_cfg = p.cfg_scale > 1
             state.img_shapes = [p.image_size]
 
         state.extra[self._STEP_KEY] = step
@@ -1905,6 +1904,8 @@ class SenseNovaU1Pipeline(
             caches_fn = self._it2i_caches if is_it2i else self._t2i_caches
             step.caches, step.think_text = caches_fn(step.p, step.ns, step.prefix)
             step.plan = self._denoise_plan(step.ns, step.p, is_it2i)
+            # Edit requests run CFG on cfg_scale or img_cfg_scale, so the plan decides.
+            state.do_true_cfg = any(step.plan.cfg_steps)
         step.cursor = None
         step.prefix = None
 
