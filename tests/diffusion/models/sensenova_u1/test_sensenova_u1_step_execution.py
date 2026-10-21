@@ -24,7 +24,8 @@ from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseN
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+# CPU tests carry the CPU mark per class; the one CUDA test is a module function.
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _nullcontext(*args, **kwargs):
@@ -112,6 +113,7 @@ def _run_to_end(pipe, cursor, step) -> None:
         step(cursor)
 
 
+@pytest.mark.cpu
 class TestCapabilityDeclaration:
     def test_pipeline_declares_both_capabilities(self):
         pipe = object.__new__(SenseNovaU1Pipeline)
@@ -119,6 +121,7 @@ class TestCapabilityDeclaration:
         assert supports_resumable_prepare(pipe) is True
 
 
+@pytest.mark.cpu
 class TestStepExecutionConfig:
     """The decode cache holds one sequence, so two of them must not be admitted."""
 
@@ -155,6 +158,7 @@ class TestStepExecutionConfig:
         SenseNovaU1Pipeline._check_step_execution_config(od_config)
 
 
+@pytest.mark.cpu
 class TestThinkStopRules:
     def test_think_end_takes_one_more_step_and_is_emitted(self):
         pipe = _pipeline({1: 2, 2: THINK_END})
@@ -200,6 +204,7 @@ class TestThinkStopRules:
         assert think_text == f"1,{THINK_END}"
 
 
+@pytest.mark.cpu
 class TestInterleaving:
     def test_two_think_cursors_interleave_to_the_same_tokens(self):
         successor = {1: 2, 2: 3, 3: THINK_END, 11: 12, 12: EOS}
@@ -236,6 +241,7 @@ class TestInterleaving:
         assert [cache for _, _, cache in shared.ar_steps] == ["a", "b"]
 
 
+@pytest.mark.cpu
 class TestTextLoop:
     def test_greedy_text_stops_on_eos_and_drops_it(self):
         pipe = _pipeline({1: 2, 2: EOS})
@@ -287,28 +293,6 @@ class TestTextLoop:
         tokens = self._sampled_tokens(pipe, flat, request_generator=[torch.Generator().manual_seed(1)], seed=7)
         assert tokens == self._sampled_tokens(pipe, flat, seed=7)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    @pytest.mark.cuda
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device(self):
-        # generator_device="cpu" gives the runner's generator a CPU device
-        # while the logits it samples from sit on the GPU.
-        pipe = _pipeline(flat=True)
-        flat = torch.zeros(1, 1, VOCAB, device="cuda")
-        cursor = pipe._begin_text(
-            flat,
-            "kv",
-            0,
-            max_tokens=4,
-            do_sample=True,
-            temperature=1.0,
-            seed=7,
-            request_generator=torch.Generator("cpu").manual_seed(7),
-        )
-        assert cursor.generator.device == flat.device
-        probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
-        torch.multinomial(probs, num_samples=1, generator=cursor.generator)
-
     def test_text_cursor_survives_being_left_between_tokens(self):
         successor = {1: 2, 2: 3, 3: EOS}
         serial = _pipeline(successor)
@@ -325,6 +309,28 @@ class TestTextLoop:
 
         assert cursor.tokens == serial_cursor.tokens
         assert cursor.t_idx == serial_cursor.t_idx
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device():
+    # generator_device="cpu" gives the runner's generator a CPU device
+    # while the logits it samples from sit on the GPU.
+    pipe = _pipeline(flat=True)
+    flat = torch.zeros(1, 1, VOCAB, device="cuda")
+    cursor = pipe._begin_text(
+        flat,
+        "kv",
+        0,
+        max_tokens=4,
+        do_sample=True,
+        temperature=1.0,
+        seed=7,
+        request_generator=torch.Generator("cpu").manual_seed(7),
+    )
+    assert cursor.generator.device == flat.device
+    probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
+    torch.multinomial(probs, num_samples=1, generator=cursor.generator)
 
 
 class _StubLanguageModel:
@@ -360,6 +366,7 @@ def _text_state(request_id: str = "req-1") -> StepRequestState:
     )
 
 
+@pytest.mark.cpu
 class TestPrepareProtocolOnTheRealPipeline:
     """The protocol methods themselves, not the cursor they drive."""
 
@@ -458,6 +465,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         assert state.extra[pipe._STEP_KEY].think_text == "thought"
 
 
+@pytest.mark.cpu
 class TestRequestModeAndStepModeAgree:
     """The claim the change rests on, at the one boundary a CPU test can reach."""
 
@@ -496,6 +504,7 @@ class TestRequestModeAndStepModeAgree:
         assert self._step_mode_text(_text_pipeline(successor, first_token=1), 0) == ""
 
 
+@pytest.mark.cpu
 class TestThroughTheRunner:
     """The pipeline's own methods, driven by the runner that will call them."""
 
@@ -672,6 +681,7 @@ class TestThroughTheRunner:
         assert "req-1" not in runner.state_cache
 
 
+@pytest.mark.cpu
 class TestReleaseStepRequest:
     """The runner's retirement callback for aborted, failed and finished requests."""
 
