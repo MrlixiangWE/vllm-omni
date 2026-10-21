@@ -176,7 +176,7 @@ A pipeline whose prepare phase produces the whole output leaves
 and finishes it as soon as prepare is done, without a denoise step.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, BAGEL, HunyuanImage3, Helios, and SenseNova-U1 / U1.5. Step execution alone does not
+Qwen-Image, BAGEL, HunyuanImage3, Helios, and SenseNova-U1.5. Step execution alone does not
 imply continuous-batching support: Qwen-Image accepts batched step states.
 BAGEL accepts batched step states for image generation with its default,
 think-mode, and single-stage deploy configs. Only the diffusion stage uses the
@@ -195,8 +195,8 @@ Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports only a single active step
 request and must use `max_num_seqs=1`.
-SenseNova-U1 and U1.5 share a pipeline that implements step execution together
-with `SupportsResumablePrepare`, and it also requires `max_num_seqs=1`: its think
+SenseNova-U1.5 implements step execution together with
+`SupportsResumablePrepare`, and it also requires `max_num_seqs=1`: its think
 and text decoding run on a model-local paged cache that holds one sequence at a
 time, and the pipeline rejects a larger value at startup.
 

@@ -9,7 +9,7 @@
 - LoRA: `sensenova/SenseNova-U1.5-8B-MoT-LoRAs` (`SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`)
 - Task: text2img, img2img, img2text (visual understanding), text2text (chat)
 - Mode: Offline inference, Online serving (OpenAI-compatible API)
-- Maintainer: @MrlixiangWE
+- Maintainer: Community
 
 ## When to use this recipe
 

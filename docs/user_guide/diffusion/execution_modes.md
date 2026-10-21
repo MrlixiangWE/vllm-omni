@@ -114,7 +114,7 @@ supports request-level execution only. See the
 [Scheduler-Managed Paged KV Cache guide](paged_kv_cache.md) for its required
 backend and configuration. Helios supports single-request step
 execution only: use
-`--step-execution --max-num-seqs 1` for Helios. SenseNova-U1 and U1.5 support
+`--step-execution --max-num-seqs 1` for Helios. SenseNova-U1.5 supports
 step execution for image, editing and text requests, also single-request only:
 the model-local paged decode cache holds one sequence, so the pipeline rejects
 `--max-num-seqs >1` at startup. Their think and text decode loops run one token
