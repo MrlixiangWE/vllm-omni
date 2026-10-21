@@ -226,6 +226,10 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
     state_refs = []
 
     class Pipeline(_ResumablePipeline):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.released = []
+
         def prepare_encode(self, state, **kwargs):
             super().prepare_encode(state, **kwargs)
             state_refs.append(weakref.ref(state))
@@ -242,6 +246,9 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
         def denoise_step(self, input_batch, **kwargs):
             self.wait_for_abort()
             return super().denoise_step(input_batch, **kwargs)
+
+        def release_step_request(self, state):
+            self.released.append(state.request_id)
 
     pipeline = Pipeline(prepare_steps=3 if phase == "prepare" else 0)
     runner = _make_runner(pipeline)
@@ -282,6 +289,7 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
         # the worker is still using inside prepare or denoise.
         assert request_id in runner.state_cache
         assert request_id in worker._step_lora_state
+        assert pipeline.released == []
         if phase == "denoise":
             assert runner.input_batch is not None
         resume.set()
@@ -294,6 +302,8 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
         assert runner.state_cache == {}
         assert worker._step_lora_state == {}
         assert runner.input_batch is None
+        # The pipeline sees the retirement once, whichever phase it was in.
+        assert pipeline.released == [request_id]
         gc.collect()
         assert state_refs[0]() is None
         assert pipeline.prepare_calls == 1
@@ -320,6 +330,45 @@ def test_worker_releases_a_normal_terminal_request_without_another_wave():
     assert runner.state_cache == {}
     assert runner.input_batch is None
     assert worker._step_lora_state == {}
+
+
+class _ReleaseRecordingPipeline(_ResumablePipeline):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.released = []
+
+    def release_step_request(self, state):
+        self.released.append(state.request_id)
+
+
+class _ReleaseRecordingTextPipeline(_TextOnlyPipeline):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.released = []
+
+    def release_step_request(self, state):
+        self.released.append(state.request_id)
+
+
+@pytest.mark.parametrize("terminal", ["prepare_failure", "prepare_only_output"])
+def test_prepare_phase_terminals_reach_the_pipeline_release_hook(monkeypatch, terminal):
+    pipeline: _ReleaseRecordingPipeline | _ReleaseRecordingTextPipeline
+    if terminal == "prepare_failure":
+        pipeline = _ReleaseRecordingPipeline(prepare_steps=3, fail_at=2)
+    else:
+        pipeline = _ReleaseRecordingTextPipeline(prepare_steps=2)
+    runner = _make_runner(pipeline)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    DiffusionModelRunner.execute_stepwise(runner, _new_output())
+    assert pipeline.released == []
+    output = DiffusionModelRunner.execute_stepwise(runner, _cached_output())
+
+    assert output.get_request_output("req-1").finished is True
+    assert runner.state_cache == {}
+    # A request that never denoises retires inside the prepare phase; the
+    # pipeline still gets the same release call as a denoised request.
+    assert pipeline.released == ["req-1"]
 
 
 class TestCapability:

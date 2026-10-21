@@ -670,3 +670,39 @@ class TestThroughTheRunner:
         assert request_output.finished is True
         assert request_output.result.output["payload"]["text"] == expected
         assert "req-1" not in runner.state_cache
+
+
+class TestReleaseStepRequest:
+    """The runner's retirement callback for aborted, failed and finished requests."""
+
+    @staticmethod
+    def _flash_cache():
+        layer = SimpleNamespace(flash_prefix_len=1, flash_total_len=2, flash_k_cache=object(), flash_v_cache=object())
+        return SimpleNamespace(layers=[layer])
+
+    def test_release_drops_the_context_and_its_flash_buffers(self):
+        pipe = object.__new__(SenseNovaU1Pipeline)
+        caches = {name: self._flash_cache() for name in ("cond", "uncond", "img_cond")}
+        caches["idx_cond"] = torch.zeros(1)
+        state = StepRequestState(request_id="aborted", sampling=OmniDiffusionSamplingParams())
+        state.extra[pipe._STEP_KEY] = SimpleNamespace(mode="it2i", caches=caches, cursor=None)
+        state.extra["other"] = "kept"
+
+        pipe.release_step_request(state)
+
+        assert pipe._STEP_KEY not in state.extra
+        assert state.extra == {"other": "kept"}
+        for name in ("cond", "uncond", "img_cond"):
+            assert vars(caches[name].layers[0]) == {}
+        # A second retirement, or one after post_decode, has nothing left to do.
+        pipe.release_step_request(state)
+
+    def test_release_during_prepare_drops_the_decode_cursor(self):
+        pipe = object.__new__(SenseNovaU1Pipeline)
+        cursor = SimpleNamespace(past_key_values=object())
+        state = StepRequestState(request_id="aborted", sampling=OmniDiffusionSamplingParams())
+        state.extra[pipe._STEP_KEY] = SimpleNamespace(mode="t2i", caches=None, cursor=cursor, prefix=object())
+
+        pipe.release_step_request(state)
+
+        assert state.extra == {}

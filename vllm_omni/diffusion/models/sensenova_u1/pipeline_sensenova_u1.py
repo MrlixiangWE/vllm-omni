@@ -1766,11 +1766,15 @@ class SenseNovaU1Pipeline(
         z = z + (t_next - t) * v_pred
         return _unpatchify(z, self.patch_size * self.merge_size, p.image_size[1], p.image_size[0])
 
-    def _denoising_output(self, caches, image_prediction, think_text="") -> DiffusionOutput:
-        """Release the KV caches and build the image output."""
+    @staticmethod
+    def _clear_denoise_caches(caches) -> None:
         for key in ("cond", "uncond", "img_cond"):
             if key in caches and not isinstance(caches[key], dict):
                 clear_flash_kv_cache(caches[key])
+
+    def _denoising_output(self, caches, image_prediction, think_text="") -> DiffusionOutput:
+        """Release the KV caches and build the image output."""
+        self._clear_denoise_caches(caches)
 
         images = _to_pil(image_prediction)
         img = images[0] if images else None
@@ -1957,6 +1961,17 @@ class SenseNovaU1Pipeline(
         if step.mode == "text":
             return step.output
         return self._denoising_output(step.caches, state.latents, step.think_text)
+
+    def release_step_request(self, state: StepRequestState) -> None:
+        """Drop a retired request's step context and its flash KV buffers.
+
+        The runner calls this for every retired state, including requests
+        aborted or failed during prepare or denoise. ``post_decode`` has already
+        popped the context of a request that finished normally.
+        """
+        step = state.extra.pop(self._STEP_KEY, None)
+        if step is not None and step.caches is not None:
+            self._clear_denoise_caches(step.caches)
 
     # -----------------------------------------------------------------------
     # Weight loading

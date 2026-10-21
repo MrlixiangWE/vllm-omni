@@ -1338,7 +1338,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         stage: str,
     ) -> RunnerOutput:
         """Drop a request whose prepare phase failed on this or another DiT rank."""
-        self.state_cache.pop(state.request_id, None)
+        self.release_step_requests([state.request_id])
         if per_req_exc is None:
             per_req_exc = RuntimeError(f"Stepwise {stage} failed on another DiT rank for {state.request_id}")
         logger.error(
@@ -1415,7 +1415,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if record_output_peak_memory and is_primary and current_omni_platform.is_available():
                     state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
                     result.peak_memory_mb = max(result.peak_memory_mb, state.peak_memory_mb)
-                self.state_cache.pop(state.request_id, None)
+                self.release_step_requests([state.request_id])
                 outputs.append(
                     RunnerOutput(
                         request_id=state.request_id,
