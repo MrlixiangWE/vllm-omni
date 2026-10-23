@@ -118,7 +118,7 @@ branch counts at 8-step 1024x1024: 2-way (`img_cfg_scale=1`, `cond`+`img_cond`)
 1.09 s; 3-way (`cfg_scale=4`, `img_cfg_scale=2`, `cond`+`img_cond`+`uncond`)
 1.74 s (3 branches on 2 ranks dispatch as `[[0, 2], [1]]`). Cache-DiT and
 layerwise CPU offload do not take effect on A3B; see
-[diffusion features](../../docs/user_guide/diffusion_features.md) note 10.
+[diffusion features](../../docs/user_guide/diffusion_features.md) note 9.
 
 Other configurations on the same machine (second run, warm kernels):
 
