@@ -947,6 +947,15 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="MiniMax-H3 reference-KV cache as JSON: mode=on, "
+            "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8. "
+            "Reference projections are skipped on reuse steps. "
+            "Omit to keep the existing attention path.",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "
@@ -990,6 +999,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=0,
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-chunk-size-mb",
+            type=int,
+            default=64,
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-mode",
