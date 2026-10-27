@@ -1738,14 +1738,15 @@ def _rank_local_prepare_failure_worker(rank: int, rendezvous: str, results) -> N
 
     torch.set_num_threads(1)
     model_runner_module.set_forward_context = _noop_forward_context
-    torch.distributed.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
-    )
-    parallel_state._WORLD = parallel_state.init_world_group([0, 1], rank, "gloo")
-    # Production device groups are NCCL; any collective on this sentinel fails,
-    # so the vote must run on the Gloo group.
-    parallel_state._WORLD.device_group = object()
     try:
+        # Spawned ranks import the test module independently, so allow for start-up skew.
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=120)
+        )
+        parallel_state._WORLD = parallel_state.init_world_group([0, 1], rank, "gloo")
+        # Production device groups are NCCL; any collective on this sentinel fails,
+        # so the vote must run on the Gloo group.
+        parallel_state._WORLD.device_group = object()
         observed = {}
         for failing_hook in ("prepare_encode", "prepare_next_chunk"):
             runner = _make_runner()
@@ -1770,7 +1771,8 @@ def _rank_local_prepare_failure_worker(rank: int, rendezvous: str, results) -> N
         results.put((rank, traceback.format_exc()))
     finally:
         parallel_state._WORLD = None
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 @pytest.mark.cpu
@@ -1781,6 +1783,7 @@ def test_rank_local_prepare_failure_is_agreed_across_dit_ranks(tmp_path):
     rank that keeps the request would enter the denoise collectives alone.
     """
     import multiprocessing as mp
+    import time
 
     ctx = mp.get_context("spawn")
     results = ctx.Queue()
@@ -1788,10 +1791,26 @@ def test_rank_local_prepare_failure_is_agreed_across_dit_ranks(tmp_path):
         ctx.Process(target=_rank_local_prepare_failure_worker, args=(rank, str(tmp_path / "rendezvous"), results))
         for rank in range(2)
     ]
+    observed: dict[int, dict] = {}
     try:
         for worker in workers:
             worker.start()
-        observed = dict(results.get(timeout=240) for _ in workers)
+        deadline = time.monotonic() + 240
+        while len(observed) < len(workers):
+            # Sampled before the wait: a rank flushes its result before exiting, so one
+            # that had already exited and still delivers nothing never sent one.
+            exited = {r: w.exitcode for r, w in enumerate(workers) if r not in observed and w.exitcode is not None}
+            try:
+                rank, payload = results.get(timeout=5)
+            except queue.Empty:
+                assert not exited, f"DiT ranks exited without a result: {exited}"
+                assert time.monotonic() < deadline, (
+                    f"no result from DiT ranks {sorted(set(range(2)) - observed.keys())}"
+                )
+                continue
+            # A rank-side traceback fails the test now instead of after the peer's timeout.
+            assert isinstance(payload, dict), f"rank {rank}:\n{payload}"
+            observed[rank] = payload
         for worker in workers:
             worker.join(timeout=60)
             assert worker.exitcode == 0
@@ -1801,7 +1820,6 @@ def test_rank_local_prepare_failure_is_agreed_across_dit_ranks(tmp_path):
                 worker.kill()
 
     for rank in range(2):
-        assert isinstance(observed[rank], dict), observed[rank]
         for failing_hook in ("prepare_encode", "prepare_next_chunk"):
             rank_view = observed[rank][failing_hook]
             assert rank_view["bad_finished"] is True, observed
