@@ -33,7 +33,9 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
     runtime protocol checks attribute presence, not the value of a false flag.
     """
 
-    # Read by Qwen2.5-VL's config; the thinker has no EVS pruning.
+    # Read by Qwen2.5-VL's protocol methods. The capability is only set when
+    # video pruning is off (see _enable_image_encoder_cudagraph), matching
+    # Qwen2.5-VL, which drops every graph modality under EVS pruning.
     is_multimodal_pruning_enabled = False
 
     # The eager tower is launch-bound, so a group that needs several replays
@@ -43,16 +45,23 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
     encoder_cudagraph_single_replay = True
 
     def _enable_image_encoder_cudagraph(self) -> None:
-        # Only the first pipeline rank runs the encoder. Dynamic-scale FP8 ViT
-        # attention advances a host-side amax slot per call, which a graph
-        # would freeze. The pipeline-group query comes last so a thinker built
-        # without a vision tower or distributed state never reaches it.
+        # Only the first pipeline rank runs the encoder. Any FP8 encoder
+        # attention keeps the eager tower: dynamic scaling advances a host-side
+        # amax slot per call, which a graph would freeze, and static scales
+        # (mm_encoder_fp8_scale_path) share that attention path. An eager
+        # thinker never captures graphs (cudagraph_mode is NONE). The
+        # pipeline-group query comes last so a thinker built without a vision
+        # tower or distributed state never reaches it.
         mm_config = self.multimodal_config
         backend = getattr(self.visual, "attn_backend", None)
         if mm_config.enable_mm_embeds:
             reason = "enable_mm_embeds is set"
         elif mm_config.mm_encoder_attn_dtype is not None:
-            reason = f"mm_encoder_attn_dtype={mm_config.mm_encoder_attn_dtype}"
+            reason = f"FP8 encoder attention is set (mm_encoder_attn_dtype={mm_config.mm_encoder_attn_dtype})"
+        elif mm_config.is_multimodal_pruning_enabled():
+            reason = "video pruning is enabled"
+        elif self.vllm_config.model_config.enforce_eager:
+            reason = "the thinker runs with enforce_eager; set enforce_eager: false on stage 0"
         elif mm_config.get_limit_per_prompt("image") <= 0:
             reason = "images are disabled"
         elif backend not in _GRAPH_ATTN_BACKENDS:

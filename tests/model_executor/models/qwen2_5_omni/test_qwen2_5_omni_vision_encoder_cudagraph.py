@@ -43,6 +43,7 @@ def _config(stage="thinker", *, embeds=False):
         get_limit_per_prompt=lambda modality: 4,
         mm_encoder_tp_mode="weights",
         mm_encoder_attn_dtype=None,
+        is_multimodal_pruning_enabled=lambda: False,
         skip_mm_profiling=False,
     )
     text = SimpleNamespace(vocab_size=8, hidden_size=4, rms_norm_eps=1e-6)
@@ -52,7 +53,9 @@ def _config(stage="thinker", *, embeds=False):
         token2wav_config=None,
     )
     cfg = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf, multimodal_config=mm, model_stage=stage, max_model_len=4096),
+        model_config=SimpleNamespace(
+            hf_config=hf, multimodal_config=mm, model_stage=stage, max_model_len=4096, enforce_eager=False
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,
@@ -139,7 +142,17 @@ def test_thinker_construction_enables_the_image_graph(monkeypatch):
 
 @pytest.mark.parametrize(
     "change",
-    ["no_image_limit", "no_visual", "sdpa_backend", "flashinfer_backend", "fp8_attention", "later_pipeline_rank", None],
+    [
+        "no_image_limit",
+        "no_visual",
+        "sdpa_backend",
+        "flashinfer_backend",
+        "fp8_attention",
+        "video_pruning",
+        "eager_thinker",
+        "later_pipeline_rank",
+        None,
+    ],
 )
 def test_image_graph_gate(monkeypatch, change):
     model = _thinker()
@@ -155,6 +168,12 @@ def test_image_graph_gate(monkeypatch, change):
         model.visual.attn_backend = AttentionBackendEnum.FLASHINFER
     elif change == "fp8_attention":
         mm.mm_encoder_attn_dtype = "fp8"
+    elif change == "video_pruning":
+        # Qwen2.5-VL's protocol methods would read the mixin's False flag.
+        mm.is_multimodal_pruning_enabled = lambda: True
+    elif change == "eager_thinker":
+        # cudagraph_mode is NONE, so the runner never captures encoder graphs.
+        model.vllm_config.model_config.enforce_eager = True
     elif change == "later_pipeline_rank":
         monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     warnings = []
@@ -163,11 +182,35 @@ def test_image_graph_gate(monkeypatch, change):
     assert supports_encoder_cudagraph(model) is (change is None)
     # An explicit opt-in that cannot apply says why; later pipeline ranks never run the encoder.
     assert len(warnings) == (0 if change in (None, "later_pipeline_rank") else 1)
+    if change == "fp8_attention":
+        assert "FP8 encoder attention" in warnings[0]
+    elif change == "eager_thinker":
+        assert "enforce_eager" in warnings[0]
 
     warnings.clear()
     model.vllm_config.compilation_config.cudagraph_mm_encoder = False
     model._enable_image_encoder_cudagraph()
     assert not warnings
+
+
+def test_forwarded_members_cover_the_protocol():
+    """The stage wrapper forwards a spelled-out member list, so a protocol
+    member added or renamed upstream has to fail here, not at capture time.
+
+    Read from the class body rather than ``__protocol_attrs__``, which only
+    exists on Python 3.12+.
+    """
+    from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+
+    declared = {
+        name
+        for name in (*vars(SupportsEncoderCudaGraph), *SupportsEncoderCudaGraph.__annotations__)
+        if not name.startswith("_")
+    }
+    assert declared
+    assert declared <= set(outer_module._THINKER_ENCODER_CUDAGRAPH_MEMBERS)
+    for name in outer_module._THINKER_ENCODER_CUDAGRAPH_MEMBERS:
+        assert hasattr(Qwen2_5OmniThinkerForConditionalGeneration, name) or name == "supports_encoder_cudagraph", name
 
 
 def test_precomputed_embeddings_keep_existing_encoder_entry(monkeypatch):

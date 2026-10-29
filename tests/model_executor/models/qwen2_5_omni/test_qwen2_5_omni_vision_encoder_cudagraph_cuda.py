@@ -53,9 +53,10 @@ def _engine_config(tp_size=1):
         get_limit_per_prompt=lambda modality: 4,
         mm_encoder_tp_mode="weights",
         mm_encoder_attn_dtype=None,
+        is_multimodal_pruning_enabled=lambda: False,
     )
     return SimpleNamespace(
-        model_config=SimpleNamespace(multimodal_config=mm, max_model_len=256),
+        model_config=SimpleNamespace(multimodal_config=mm, max_model_len=256, enforce_eager=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,
