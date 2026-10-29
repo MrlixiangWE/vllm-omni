@@ -78,7 +78,9 @@ def test_rejects_invalid_worker_row_capacity(max_num_rows) -> None:
         _manager(32, max_num_rows=max_num_rows)
 
 
-def test_aggregate_worker_rows_backpressure_before_native_allocation(monkeypatch) -> None:
+def test_live_reservations_are_not_bounded_by_the_worker_row_pool() -> None:
+    # Worker rows hold only scheduled requests; a prefetched reservation beside
+    # a running one may exceed the pool and is admitted while blocks fit.
     manager = _manager(32, max_num_rows=4)
     context = DiffusionKVContext(context_id="ar", cache_role="ar_decode", num_tokens=8)
 
@@ -89,26 +91,9 @@ def test_aggregate_worker_rows_backpressure_before_native_allocation(monkeypatch
     assert first is not None
     assert len(first.sequences) == 2
     assert len(first.contexts) == 1
-    free_before = manager.native_manager.block_pool.get_num_free_blocks()
-    allocate_slots = manager.native_manager.allocate_slots
-    allocations = []
-
-    def allocate(*args, **kwargs):
-        allocations.append(args[0].request_id)
-        return allocate_slots(*args, **kwargs)
-
-    monkeypatch.setattr(manager.native_manager, "allocate_slots", allocate)
-    assert manager.reserve_request("second", requests("second")) is None
-    assert not manager.has_request("second")
-    assert allocations == []
-    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
-
-    # An exact-fit primary row is still admissible while the larger request waits.
-    assert manager.reserve_request("small", (_request("small", 0),)) is not None
-    manager.free_request("first")
     assert manager.reserve_request("second", requests("second")) is not None
+    manager.free_request("first")
     manager.free_request("second")
-    manager.free_request("small")
     assert not manager._internal_request_ids
 
 

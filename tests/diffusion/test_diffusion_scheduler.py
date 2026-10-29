@@ -640,8 +640,8 @@ class TestRequestScheduler:
         )
         assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
-    @pytest.mark.parametrize("max_num_rows, expected_ids", [(4, ["first"]), (16, ["first", "second"])])
-    def test_aggregate_worker_rows_gate_concurrent_context_requests(self, max_num_rows, expected_ids) -> None:
+    def test_concurrent_context_requests_fit_the_factory_row_pool(self) -> None:
+        max_num_rows = 16
         _initialize_paged_scheduler(self.scheduler, max_num_seqs=4, max_num_rows=max_num_rows)
         for request_id in ("first", "second"):
             request = _make_request(request_id)
@@ -661,15 +661,10 @@ class TestRequestScheduler:
             self.scheduler.add_request(request)
 
         output = self.scheduler.schedule()
-        assert _new_ids(output) == expected_ids
+        assert _new_ids(output) == ["first", "second"]
         manager = self.scheduler._diffusion_kv_manager
         assert manager is not None
         assert manager.max_num_rows == max_num_rows
-        if max_num_rows == 4:
-            assert output.num_waiting_reqs == 1
-            assert not manager.has_request("second")
-            self.scheduler.finish_requests("first", DiffusionRequestStatus.FINISHED_ABORTED)
-            assert _new_ids(self.scheduler.schedule()) == ["second"]
 
     def test_diffusion_kv_row_limit_rejects_contexts_before_allocation(self, mocker: MockerFixture) -> None:
         _initialize_paged_scheduler(self.scheduler, max_rows_per_request=2)

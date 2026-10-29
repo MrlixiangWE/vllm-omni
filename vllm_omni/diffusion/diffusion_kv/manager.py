@@ -304,11 +304,11 @@ class DiffusionKVCacheManager:
                 "increase KV cache capacity or reduce the request sequence/context count or length"
             )
 
-        # Worker rows are a separate resource from native KV blocks. Include
-        # primary sequences and deduplicated contexts of every live reservation,
-        # including requests waiting for a prefetched transfer to complete.
-        if len(self._internal_request_ids) + num_rows > self.max_num_rows:
-            return None
+        # No aggregate Worker-row gate: rows are installed only for scheduled
+        # requests (at most max_num_seqs, each within max_rows_per_request), and
+        # the factory sizes the row pool as their product. Prefetched and
+        # draining reservations hold blocks, not rows, so counting them would
+        # refuse a prefetch that the pool can hold.
 
         allocated: list[DiffusionKVRequest | _ContextKVRequest] = []
         sequence_metadata: list[DiffusionKVSequenceMetadata] = []
