@@ -50,7 +50,8 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
         # attention keeps the eager tower: dynamic scaling advances a host-side
         # amax slot per call, which a graph would freeze, and static scales
         # (mm_encoder_fp8_scale_path) share that attention path. The runner
-        # captures no graph when cudagraph_mode is NONE, which an eager thinker
+        # captures no graph when cudagraph_mode is NONE (or still unresolved,
+        # which CompilationConfig also treats as NONE), as an eager thinker
         # implies; the eager case gets its own message because it is the
         # deploy default. The pipeline-group query comes last so a thinker
         # built without a vision tower or distributed state never reaches it.
@@ -64,7 +65,7 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
             reason = "video pruning is enabled"
         elif self.vllm_config.model_config.enforce_eager:
             reason = "the thinker runs with enforce_eager; set enforce_eager: false on stage 0"
-        elif self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+        elif self.vllm_config.compilation_config.cudagraph_mode in (None, CUDAGraphMode.NONE):
             reason = "compilation_config.cudagraph_mode is NONE"
         elif mm_config.get_limit_per_prompt("image") <= 0:
             reason = "images are disabled"

@@ -153,6 +153,7 @@ def test_thinker_construction_enables_the_image_graph(monkeypatch):
         "video_pruning",
         "eager_thinker",
         "no_cudagraph_mode",
+        "unresolved_cudagraph_mode",
         "later_pipeline_rank",
         None,
     ],
@@ -180,6 +181,9 @@ def test_image_graph_gate(monkeypatch, change):
     elif change == "no_cudagraph_mode":
         # An explicit NONE mode with a compiled thinker captures nothing either.
         model.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    elif change == "unresolved_cudagraph_mode":
+        # CompilationConfig treats a mode VllmConfig never resolved as NONE.
+        model.vllm_config.compilation_config.cudagraph_mode = None
     elif change == "later_pipeline_rank":
         monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     warnings = []
@@ -192,7 +196,7 @@ def test_image_graph_gate(monkeypatch, change):
         assert "FP8 encoder attention" in warnings[0]
     elif change == "eager_thinker":
         assert "enforce_eager" in warnings[0]
-    elif change == "no_cudagraph_mode":
+    elif change in ("no_cudagraph_mode", "unresolved_cudagraph_mode"):
         assert "cudagraph_mode is NONE" in warnings[0]
 
     warnings.clear()
@@ -207,7 +211,10 @@ def test_forwarded_members_cover_the_protocol():
 
     Read from the class bodies along the MRO rather than ``__protocol_attrs__``,
     which only exists on Python 3.12+, so members of a parent protocol count.
+    ``inspect.get_annotations`` also finds annotation-only members on 3.14,
+    where class annotations are materialized lazily.
     """
+    from inspect import get_annotations
     from typing import Generic, Protocol
 
     from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
@@ -216,7 +223,7 @@ def test_forwarded_members_cover_the_protocol():
         name
         for cls in SupportsEncoderCudaGraph.__mro__
         if cls not in (Protocol, Generic, object)
-        for name in (*vars(cls), *vars(cls).get("__annotations__", {}))
+        for name in (*vars(cls), *get_annotations(cls))
         if not name.startswith("_")
     }
     assert declared
