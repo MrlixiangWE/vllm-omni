@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from vllm.config import CUDAGraphMode
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -58,6 +59,7 @@ def _config(stage="thinker", *, embeds=False):
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
         compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
             cudagraph_mm_encoder=True,
             encoder_cudagraph_token_budgets=[64, 128],
             encoder_cudagraph_max_vision_items_per_batch=2,
@@ -150,6 +152,7 @@ def test_thinker_construction_enables_the_image_graph(monkeypatch):
         "fp8_attention",
         "video_pruning",
         "eager_thinker",
+        "no_cudagraph_mode",
         "later_pipeline_rank",
         None,
     ],
@@ -174,6 +177,9 @@ def test_image_graph_gate(monkeypatch, change):
     elif change == "eager_thinker":
         # cudagraph_mode is NONE, so the runner never captures encoder graphs.
         model.vllm_config.model_config.enforce_eager = True
+    elif change == "no_cudagraph_mode":
+        # An explicit NONE mode with a compiled thinker captures nothing either.
+        model.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     elif change == "later_pipeline_rank":
         monkeypatch.setattr(graph_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     warnings = []
@@ -186,6 +192,8 @@ def test_image_graph_gate(monkeypatch, change):
         assert "FP8 encoder attention" in warnings[0]
     elif change == "eager_thinker":
         assert "enforce_eager" in warnings[0]
+    elif change == "no_cudagraph_mode":
+        assert "cudagraph_mode is NONE" in warnings[0]
 
     warnings.clear()
     model.vllm_config.compilation_config.cudagraph_mm_encoder = False
@@ -197,14 +205,18 @@ def test_forwarded_members_cover_the_protocol():
     """The stage wrapper forwards a spelled-out member list, so a protocol
     member added or renamed upstream has to fail here, not at capture time.
 
-    Read from the class body rather than ``__protocol_attrs__``, which only
-    exists on Python 3.12+.
+    Read from the class bodies along the MRO rather than ``__protocol_attrs__``,
+    which only exists on Python 3.12+, so members of a parent protocol count.
     """
+    from typing import Generic, Protocol
+
     from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
 
     declared = {
         name
-        for name in (*vars(SupportsEncoderCudaGraph), *SupportsEncoderCudaGraph.__annotations__)
+        for cls in SupportsEncoderCudaGraph.__mro__
+        if cls not in (Protocol, Generic, object)
+        for name in (*vars(cls), *vars(cls).get("__annotations__", {}))
         if not name.startswith("_")
     }
     assert declared

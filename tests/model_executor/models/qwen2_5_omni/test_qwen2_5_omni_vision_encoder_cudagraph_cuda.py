@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from tests.helpers.mark import hardware_marks
@@ -59,6 +60,7 @@ def _engine_config(tp_size=1):
         model_config=SimpleNamespace(multimodal_config=mm, max_model_len=256, enforce_eager=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
         compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
             cudagraph_mm_encoder=True,
             encoder_cudagraph_token_budgets=BUDGETS,
             encoder_cudagraph_max_vision_items_per_batch=2,

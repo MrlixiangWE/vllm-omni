@@ -5,6 +5,7 @@
 import dataclasses
 from typing import Any
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
@@ -48,10 +49,11 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
         # Only the first pipeline rank runs the encoder. Any FP8 encoder
         # attention keeps the eager tower: dynamic scaling advances a host-side
         # amax slot per call, which a graph would freeze, and static scales
-        # (mm_encoder_fp8_scale_path) share that attention path. An eager
-        # thinker never captures graphs (cudagraph_mode is NONE). The
-        # pipeline-group query comes last so a thinker built without a vision
-        # tower or distributed state never reaches it.
+        # (mm_encoder_fp8_scale_path) share that attention path. The runner
+        # captures no graph when cudagraph_mode is NONE, which an eager thinker
+        # implies; the eager case gets its own message because it is the
+        # deploy default. The pipeline-group query comes last so a thinker
+        # built without a vision tower or distributed state never reaches it.
         mm_config = self.multimodal_config
         backend = getattr(self.visual, "attn_backend", None)
         if mm_config.enable_mm_embeds:
@@ -62,6 +64,8 @@ class Qwen2_5OmniVisionEncoderCudaGraphMixin:
             reason = "video pruning is enabled"
         elif self.vllm_config.model_config.enforce_eager:
             reason = "the thinker runs with enforce_eager; set enforce_eager: false on stage 0"
+        elif self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            reason = "compilation_config.cudagraph_mode is NONE"
         elif mm_config.get_limit_per_prompt("image") <= 0:
             reason = "images are disabled"
         elif backend not in _GRAPH_ATTN_BACKENDS:
