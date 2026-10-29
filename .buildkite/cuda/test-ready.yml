@@ -20,6 +20,9 @@ steps:
         timeout_in_minutes: 15
         source_file_dependencies:
           - tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_vision_encoder_cudagraph_tp_cuda.py
+          - tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_vision_encoder_cudagraph_cuda.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
           - vllm_omni/model_executor/models/qwen2_5_omni/vision_encoder_cudagraph.py
           - vllm_omni/worker/encoder_cudagraph.py
         commands:

@@ -225,8 +225,8 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
         assert manager.get_cumulative_stats()["num_budgets"] == len(BUDGETS)
         # An image filling the smallest budget; a grid whose windows do not
         # tile it (partial windows, padded replay); one 256-patch image filling
-        # the largest budget, longer than one attention tile; two images the
-        # manager packs into one replay in reverse order.
+        # the largest budget, longer than one attention tile; two images of
+        # different sizes in one replay.
         cases = [[[1, 4, 8]], [[1, 6, 10]], [[1, 16, 16]], [[1, 8, 8], [1, 4, 8]]]
         retained = []
         for seed, grids in enumerate(cases):
